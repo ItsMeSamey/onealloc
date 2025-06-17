@@ -18,11 +18,11 @@ pub const SerializableSignature = struct {
   T: type,
   /// The transformed type going from bottom up. This may be (not always) same as T on a terminal node
   U: type,
-  /// The type used for storing dynamic data, this is the type returned after calling `getDynamicData`
+  /// The type used for storing dynamic data, this is the return type of `getDynamicData`
   DD: type,
   /// Static size (in bits if pack, in bytes if default/noalign)
   static_size: comptime_int,
-  /// Always one in case noalign is chosen
+  /// Always .@"1" unless .default is used
   alignment: std.mem.Alignment,
 
   pub const IntegerTypeType = struct {
@@ -41,23 +41,28 @@ pub const ToSerializableOptions = struct {
   T: type,
   /// Control how value bytes are serialized
   serialization: SerializationOptions = .default,
-  /// Type given to the `len` argument of slices
+  /// Type given to the `len` argument of slices.
+  /// NOTE: It is useless to change this unless you are using non-default serialization as well
+  ///   Your choice will still be respected though
   slice_len_type: type = usize,
   /// If int is supplied, this does nothing at all. If enum supplied is non-exhaustive
   /// and smallest int needed to represent all of its fields is smaller then one used,
   /// the enum fields will be remapped to optimize for size
   /// keys.get will still give the original value as a result
   ///
-  /// Recommended to keep on
+  /// NOTE: You should ideally use, `GetShrunkEnumType` function when declaring structs themselves
+  ///   because this has a runtime cost
   shrink_enum: bool = true,
   /// Split and reserialize array values according to serialization. This does nothing if it doesn't have to.
   /// This has no effect with serialization = .default or if array elements have no padding after serialization.
   reserialize_array: bool = true,
   /// Make all the sub structs `Serializable` as well with the same config if they are not already
-  /// If this is 0, no recursion is done at all
-  recurse: comptime_int = 0,
+  /// If this is 0, Sub structs / unions / error!unions / optional (excluding optional pointers) won't be analyzed,
+  ///   Their serializer will just write out their raw bytes only
+  /// A reasonably large number is chosen as a default
+  recurse: comptime_int = 1024,
   /// Error if recurse = 0
-  error_on_0_recurse: bool = false,
+  error_on_0_recurse: bool = true,
   /// Weather to dereference pointers or use them by value
   /// Max Number of times dereferencing is allowed.
   /// 0 means no dereferencing is done at all
@@ -73,9 +78,6 @@ pub const ToSerializableOptions = struct {
   deslice: comptime_int = 1,
   /// Error if deslice = 0
   error_on_0_deslice: bool = false,
-  /// How many times can the nested struct be de-nested. Denesting includes dereferencing, and dearraying.
-  /// This has no effect if the struct is non-recursive
-  denest: comptime_int = 0,
   /// Optionals take less space when they are null but you can't change their value after initialization
   /// Has effect only if optional's size > child size (has no effect on pointers for example)
   dynamic_optionals: bool = false,
@@ -84,6 +86,8 @@ pub const ToSerializableOptions = struct {
   dynamic_unions: bool = false,
   /// If set to true, serialize a Many / C pointer as a uint, otherwise throw a compileError
   serialize_many_pointer_as_usize: bool = true,
+  /// It is highly recommended to keep this on unless you have a REALLY good reason to turn it off
+  sort_fields: bool = true,
 
   pub const SerializationOptions = enum {
     ///stuffs together like in packed struct, 2 u22's take up 44 bits
@@ -236,6 +240,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
       },
     },
     .array => |ai| opaque {
+      pub const IsSameOld = if (@hasDecl(U, "IsSameOld") and !U.IsSameOld) false else true;
       const U = ToSerializableOptions(ai.child, options, if (align_hint) |hint| .fromByteUnits(@min(@alignOf(ai.child), hint.toByteUnits())) else null);
 
       pub const Signature = SerializableSignature{
@@ -279,9 +284,9 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
       }
 
       pub const ArrayIterator = struct {
+        da: Signature.DD,
         static: []align(Signature.alignment.toByteUnits()) u8,
         offset: if (options.serialization == .pack) u3 else u0 = 0,
-        da: Signature.DD,
 
         pub fn get(self: @This(), i: std.math.IntFittingRange(0, ai.len)) U {
           return switch (options.serialization) {
@@ -296,15 +301,135 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
         return .{ .static = static, .offset = offset, .da = da, };
       }
     },
-    .@"struct" => opaque {
+    .@"struct" => |si| if (options.recurse == 0) GetDirectSerializableT(T, options) else opaque {
+      const sub_options = init: {
+        var retval = options;
+        retval.recurse -= 1;
+        break :init retval;
+      };
+
+      const UInfo: std.builtin.Type.Struct = .{
+        .layout = switch (options.serialization) {
+          .default, .noalign => .auto,
+          .pack => .@"packed",
+        },
+        // Transformed fields (these are sorted unless options.sort_fields is false)
+        .fields = blk: {
+          if (!options.sort_fields) break :blk si.fields;
+          var fields_array: [si.fields.len]std.builtin.Type.StructField = si.fields[0..si.fields.len].*;
+          for (fields_array) |*f| {
+            f.type = ToSerializableT(T, sub_options, f.alignment);
+            switch (options.serialization) {
+              .default => {},
+              .noalign => f.alignment = 1,
+              .pack => f.alignment = 0,
+            }
+          }
+
+          std.sort.block(std.builtin.Type.StructField, &fields_array, void, struct{
+            /// Rhs and Lhs are reversed because we want to sort in reverse order
+            fn inner(_: void, rhs: std.builtin.Type.StructField, lhs: std.builtin.Type.StructField) bool {
+              switch (options.serialization) {
+                .default => {
+                  if (lhs.alignment < rhs.alignment) return true;
+                  return lhs.type.Signature.static_size < rhs.type.Signature.static_size;
+                },
+                .noalign => {
+                  if (@alignOf(lhs.type) < @alignOf(rhs.type)) return true;
+                  return lhs.type.Signature.static_size < rhs.type.Signature.static_size;
+                },
+                .pack => return if (lhs.type.Signature.static_size == 0) rhs.type.Signature.static_size != 0
+                  else @ctz(lhs.type.Signature.static_size) < @ctz(rhs.type.Signature.static_size),
+              }
+            }
+          }.inner);
+
+          break :blk &fields_array;
+        },
+        .decls = &.{},
+        .is_tuple = si.is_tuple,
+      };
+
+      pub const IsSameOld = options.serialization == .default and blk: {
+        for (UInfo.fields) |f| {
+          if (@hasDecl(f.type, "IsSameOld") and !f.type.IsSameOld) break :blk false;
+        }
+        break :blk true;
+      };
+
+      const DDInfo: std.builtin.Type.Struct = .{
+        .layout = .auto,
+        .fields = blk: {
+          var retval: [si.fields.len]std.builtin.Type.StructField = undefined;
+          for (UInfo.fields, 0..) |f, i| {
+            retval[i] = .{
+              .name = f.name,
+              .type = f.type.Signature.DD,
+              .default_value_ptr = null,
+              .is_comptime = false,
+              .alignment = @alignOf(f.type.Signature.DD),
+            };
+          }
+          break :blk &retval;
+        },
+        .decls = &.{},
+        .is_tuple = si.is_tuple,
+      };
+
+      pub const Signature = SerializableSignature{
+        .T = T,
+        .U = @Type(.{ .@"struct" = UInfo }),
+        .DD = @Type(.{ .@"struct" = DDInfo }),
+        .static_size = switch (options.serialization) {
+          .default, .noalign => @sizeOf(T),
+          .pack => @bitSizeOf(T),
+        },
+        .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
+      };
+
+      pub fn writeStatic(val: *const T, _bytes: []align(Signature.alignment.toByteUnits()) u8, _offset: if (options.serialization == .pack) u3 else u0) void {
+        var bytes = _bytes;
+        var offset = _offset;
+        inline for (UInfo.fields) |f| {
+          f.type.writeStatic(&@field(val, f.name), bytes, offset);
+          switch (options.serialization) {
+            .default, .noalign => bytes = bytes[Signature.static_size..],
+            .pack => {
+              const new_offset = Signature.static_size + offset;
+              bytes = bytes[new_offset >> 3];
+              offset = new_offset & 0b111;
+            }
+          }
+        }
+      }
+
+      pub fn getDynamicData(val: *const T) Signature.DD {
+        var retval: Signature.DD = undefined;
+        for (UInfo.fields) |f| @field(retval, f.name) = f.type.getDynamicData(&@field(val, f.name));
+        return retval;
+      }
+
+      pub const StructIterator = struct {
+        da: Signature.DD,
+        static: []align(Signature.alignment.toByteUnits()) u8,
+        offset: if (options.serialization == .pack) u3 else u0 = 0,
+
+        pub fn get(self: @This(), comptime name: []const u8) T {
+          return @field(self.static[0..Signature.static_size], name);
+        }
+      };
+
+      pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) StructIterator {
+        return .{ .static = static, .offset = offset, .da = da, };
+      }
     },
     .optional => opaque {},
     .error_union => opaque {},
     .@"enum" => |ei| opaque {
       const min_bits = std.math.log2_int_ceil(usize, ei.fields.len);
       /// If this is true, EnumType is the shrunk enum type, else it is same as Signature.T
-      pub const IsShrunkEnum = options.shrink_enum and @bitSizeOf(T) > min_bits and !ei.is_exhaustive;
-      const EnumType = if (IsShrunkEnum) GetShrunkEnumType(T) else T;
+      pub const IsSameOld = ei.is_exhaustive or options.shrink_enum and @bitSizeOf(T) == min_bits;
+      const EnumType = if (IsSameOld) T else GetShrunkEnumType(T);
       const TagType = @typeInfo(Signature.U).@"enum".tag_type;
       const Direct = GetDirectSerializableT(Signature.U, options, align_hint);
 
@@ -316,15 +441,15 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
         .alignment = Direct.Signature.alignment,
       };
 
-
       /// `bytes` should always have enough bytes/bits.
       /// This MUST write exactly `Signature.static_size` bits if Signature.serialization == .packed / bytes otherwise
       /// offset is always 0 unless packed is used
       pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
         if (min_bits == 0) return;
-        if (!IsShrunkEnum) return Direct.writeStatic(@ptrCast(val), bytes, offset);
+        if (IsSameOld) return Direct.writeStatic(@ptrCast(val), bytes, offset);
 
-        const OGTT = ei.tag_type;
+        const OGTT = ei.tag_type; // Original TagType
+        // This generates better assembly (or so std.meta.intToEnum says)
         const array: []const OGTT = comptime blk: {
           var retval: []const OGTT = &.{};
           for (ei.fields, 0..) |f, i| retval[i] = f.value;
@@ -353,7 +478,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
 
       /// Convert the given value to original type, this is a no-op if enum is not a shrunk_enum
       pub fn toOriginalT(val: Signature.U) T {
-        return if (!IsShrunkEnum) val else @enumFromInt(@typeInfo(T).@"enum".fields[@intFromEnum(val)]);
+        return if (IsSameOld) val else @enumFromInt(@typeInfo(T).@"enum".fields[@intFromEnum(val)]);
       }
     },
     .@"union" => {},
