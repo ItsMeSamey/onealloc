@@ -51,17 +51,6 @@ pub const ToSerializableOptions = struct {
   /// NOTE: You should ideally use, `GetShrunkEnumType` function when declaring structs themselves
   ///   because this has a runtime cost
   shrink_enum: bool = true,
-  // /// Optionals take less space when they are null but you can't change their value after initialization
-  // /// Has effect only if optional's size > child size (has no effect on pointers for example)
-  // dynamic_optionals: bool = false,
-  // /// Unions take less space when a smaller than maximum sized union is selected, you cant change their value type after initialization
-  // /// This has no effect if the union is not tagged or has equal sized options
-  // dynamic_unions: bool = false,
-  // /// Nullable pointers take less space when they are null but you can't change their value from null to non-null or non-null to null after initialization
-  // dynamic_nullable_pointers: bool = false,
-  // /// Error unions take less space if one of the type is smaller, but you cant change the type afterwards.
-  // /// This has no 
-  // dynamic_error_unions: bool = false,
   /// If set to true, serialize a Many / C / anyopaque pointer as a uint, otherwise throw a compileError
   serialize_unknown_pointer_as_usize: bool = true,
   /// Type given to the `len` argument of slices.
@@ -229,7 +218,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
           break :blk retval;
         };
 
-        const Signature = SerializableSignature{
+        pub const Signature = SerializableSignature{
           .T = T,
           .U = T,
           .DD = Signature.EmptyDD,
@@ -401,8 +390,64 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
         return .{ .static = static, .offset = offset, .da = da, };
       }
     },
-    .optional => opaque {},
-    .error_union => opaque {},
+    .optional => |oi| opaque {
+      const U = ToSerializableT(union(enum) { None: void, Some: oi.child }, options, align_hint);
+
+      pub const Signature = SerializableSignature{
+        .T = T,
+        .U = U,
+        .DD = U.Signature.DD,
+        .static_size = U.Signature.static_size,
+        .alignment = U.Signature.alignment,
+      };
+      pub const IsSameOld = U.IsSameOld;
+
+      pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
+        const u = @unionInit(Signature.U.Signature.T, if (val.*) "Some" else "None", if (val.*) |v| v else {});
+        U.writeStatic(&u, bytes, offset);
+      }
+
+      pub fn getDynamicData(val: *const T) Signature.DD {
+        const u = @unionInit(Signature.U.Signature.T, if (val.*) "Some" else "None", if (val.*) |v| v else {});
+        return U.getDynamicData(&u);
+      }
+
+      pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) T {
+        return switch (U.read(static, offset, da)) {
+          .None => null,
+          .Some => |v| v,
+        };
+      }
+    },
+    .error_union => |ei| opaque {
+      const U = ToSerializableT(union(enum) { Err: ei.error_set, Some: ei.payload }, options, align_hint);
+
+      pub const Signature = SerializableSignature{
+        .T = T,
+        .U = U,
+        .DD = U.Signature.DD,
+        .static_size = U.Signature.static_size,
+        .alignment = U.Signature.alignment,
+      };
+      pub const IsSameOld = U.IsSameOld;
+
+      pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
+        const u = @unionInit(Signature.U.Signature.T, if (std.meta.isError(val.*)) "Err" else "Ok", val.* catch |e| e);
+        U.writeStatic(&u, bytes, offset);
+      }
+
+      pub fn getDynamicData(val: *const T) Signature.DD {
+        const u = @unionInit(Signature.U.Signature.T, if (std.meta.isError(val.*)) "Err" else "Ok", val.* catch |e| e);
+        return U.getDynamicData(&u);
+      }
+
+      pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) T {
+        return switch (U.read(static, offset, da)) {
+          .Err => |e| e,
+          .Some => |v| v,
+        };
+      }
+    },
     .@"enum" => |ei| if (ei.is_exhaustive or (options.shrink_enum and @bitSizeOf(T) == std.math.log2_int_ceil(usize, ei.fields.len))) blk: {
       break :blk GetDirectSerializableT(T, options, align_hint);
     } else opaque {
@@ -584,6 +629,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
 /// Convert any type to a serializable type, any unsupported types present in the struct will result in 
 /// Be careful with this option when using recursive structs
 pub fn ToSerializable(options: ToSerializableOptions) type {
-  return ToSerializableT(options.T, options) catch |e| @compileError(std.fmt.comptimePrint("Error: {!} while serializing {s}", .{e, @typeName(options.T)}));
+  return ToSerializableT(options.T, options, null) catch |e|
+    @compileError(std.fmt.comptimePrint("Error: {!} while serializing {s}", .{e, @typeName(options.T)}));
 }
 
