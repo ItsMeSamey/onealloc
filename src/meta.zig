@@ -482,7 +482,10 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
               }
               return switch (options.serialization) {
                 .default, .noalign => f.type.read(self.static[offset..], self.offset, self.dynamic),
-                .pack => f.type.read(self.static[(offset >> 3) + (((offset&7) + self.offset) >> 3)..], @intCast((self.offset + (offset&7)) & 7), self.dynamic),
+                .pack => blk: {
+                  const after_sum = offset + self.offset;
+                  break :blk f.type.read(self.static[after_sum >> 3..], @intCast(after_sum & 0b111), self.dynamic);
+                },
               };
             }
             unreachable;
@@ -606,7 +609,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
         }
 
         pub fn set(self: @This(), val: T) void {
-          writeStatic(&val, self.bytes, 0);
+          writeStatic(&val, self.underlying.bytes, self.underlying.offset);
         }
       };
 
@@ -634,24 +637,22 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
       };
 
       break :blk opaque {
-        pub const IsSameOld = options.serialization == .default and blk: {
-          for (UInfo.fields, ui.fields) |f, s| {
-            if (f.name != s.name or @hasDecl(f.type, "IsSameOld") and !f.type.IsSameOld) break :blk false;
-          }
-          break :blk true;
-        };
-
         const SubMax = blk: {
           var max = 0;
           for (UInfo.fields) |f| max = @max(max, f.type.Signature.static_size);
           break :blk max;
         };
 
+        const IsStatic = blk: {
+          for (UInfo.fields) |f| if (std.meta.hasFn(f.type, "writeDynamic")) break :blk false;
+          break :blk true;
+        };
+
         pub const Signature = SerializableSignature{
           .T = T,
           .U = @Type(.{ .@"union" = UInfo }),
           .static_size = switch (options.serialization) {
-            .default => if (IsSameOld) @sizeOf(T),
+            .default => @sizeOf(T),
             else => SubMax + (if (options.serialization == .noalign) std.math.divCeil(comptime_int, @bitSizeOf(TagType), 8) else @bitSizeOf(TagType)),
           },
           .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
@@ -685,7 +686,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
           unreachable;
         }
 
-        pub fn getDynamicSize(val: *const T) usize {
+        fn _getDynamicSize(val: *const T) usize {
           const active_tag = std.meta.activeTag(val.*);
           inline for (UInfo.fields) |f| {
             const ftag = comptime std.meta.stringToEnum(TagType, f.name);
@@ -694,7 +695,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
           unreachable;
         }
 
-        pub fn writeDynamic(val: *const T, bytes: []u8) usize {
+        fn _writeDynamic(val: *const T, bytes: []u8) usize {
           const active_tag = std.meta.activeTag(val.*);
           inline for (UInfo.fields) |f| {
             const ftag = comptime std.meta.stringToEnum(TagType, f.name);
@@ -703,22 +704,53 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
           unreachable;
         }
 
-        pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) Signature.U {
-          const active_tag: TagType = @enumFromInt(switch (options.serialization) {
-            .default => @as(TagInt, @bitCast(static[SubMax..][0..@sizeOf(TagInt)])),
-            .noalign => @as(TagInt, @bitCast(static[SubMax..][0..std.math.divCeil(comptime_int, @bitSizeOf(TagInt), 8)])),
-            .pack => blk: {
-              const tag_offset = SubMax + offset;
-              const _static = static[tag_offset >> 3..];
-              const _offset = tag_offset & 0b111;
-              break :blk std.mem.readPackedInt(SizedInt, _static, _offset, native_endian);
-            },
-          });
+        fn _readDynamicSize(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) usize {
+          const gs = GS{ .static = static, .dynamic = dynamic, .offset = offset };
+          const active_tag = gs.activeTag();
           inline for (UInfo.fields) |f| {
             const ftag = comptime std.meta.stringToEnum(TagType, f.name);
-            if (ftag == active_tag) return @unionInit(Signature.U, f.name, f.type.read(static[0..SubMax], offset, dynamic));
+            if (ftag == active_tag) return f.type.readDynamicSize(static[0..SubMax], offset, dynamic);
           }
           unreachable;
+        }
+
+        pub const getDynamicSize = if (IsStatic) void else _getDynamicSize;
+        pub const writeDynamic = if (IsStatic) void else _writeDynamic;
+        pub const readDynamicSize = if (IsStatic) void else _readDynamicSize;
+
+        const GS = struct {
+          static: []u8,
+          dynamic: []const u8,
+          offset: if (options.serialization == .pack) u3 else u0 = 0,
+
+          fn activeTag(self: @This()) TagType {
+            const static = self.static;
+            return @enumFromInt(switch (options.serialization) {
+              .default => @as(TagInt, @bitCast(static[SubMax..][0..@sizeOf(TagInt)])),
+              .noalign => @as(TagInt, @bitCast(static[SubMax..][0..std.math.divCeil(comptime_int, @bitSizeOf(TagInt), 8)])),
+              .pack => blk: {
+                const tag_offset = SubMax + self.offset;
+                break :blk std.mem.readPackedInt(SizedInt, static[tag_offset >> 3..], tag_offset & 0b111, native_endian);
+              },
+            });
+          }
+
+          pub fn get(self: @This()) T {
+            const active_tag = self.activeTag();
+            inline for (UInfo.fields) |f| {
+              const ftag = comptime std.meta.stringToEnum(TagType, f.name);
+              if (ftag == active_tag) return @unionInit(Signature.U, f.name, f.type.read(self.static[0..SubMax], self.offset, self.dynamic));
+            }
+            unreachable;
+          }
+
+          pub fn set(self: @This(), val: T) void {
+            writeStatic(&val, self.bytes, self.offset);
+          }
+        };
+
+        pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) GS {
+          return .{ .static = static, .dynamic = dynamic, .offset = offset };
         }
       };
     },
