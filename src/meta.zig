@@ -119,7 +119,7 @@ fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hint: ?
     pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
       if (I == u0) return;
       switch (comptime options.serialization) {
-        .default, .noalign => bytes[0..Signature.static_size].* = @as(I, @bitCast(val.*)),
+        .default, .noalign => bytes[0..Signature.static_size].* = std.mem.toBytes(@as(I, @bitCast(val.*)))[0..Signature.static_size].*,
         .pack => std.mem.writePackedInt(I, bytes, offset, @as(I, @bitCast(val.*)), native_endian),
       }
     }
@@ -242,15 +242,11 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
           pub const IsSameOld = U.IsSameOld;
 
           pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
-            U.writeStatic(&val.*, bytes, offset);
-            if (options.compact_pointers) return;
-            switch (options.serialization) {
-              .default, .noalign => {
-                bytes[0..@sizeOf(usize)].* = @as(usize, @bitCast(bytes[@sizeOf(usize)..].ptr));
-                U.writeStatic(&val.*, bytes[Signature.static_size..], offset);
-              },
+            if (!options.compact_pointers) switch (options.serialization) {
+              .default, .noalign => bytes[0..@sizeOf(usize)].* = std.mem.toBytes(@as(usize, @bitCast(bytes[@sizeOf(usize)..].ptr))),
               .pack => unreachable, // options.compact_pointers must be true when options.serialization = .pack
-            }
+            };
+            return U.writeStatic(&val.*, if (!options.compact_pointers) bytes[0..@sizeOf(usize)] else bytes, offset);
           }
 
           pub fn getDynamicData(val: *const T) Signature.DD {
@@ -270,11 +266,57 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
       .slice => if (options.deslice == 0) if (options.error_on_0_deslice) blk: {
         @compileLog("Cannot deslice type " ++ @typeName(T) ++ " any further as options.dereference is 0\n");
         break :blk error.ErrorOn0Dereference;
-      } else opaque {
-        const next_options = blk: {
+      } else blk: {
+        const U = try ToSerializableT(T, next_options: {
           var retval = options;
           retval.deslice -= 1;
-          break :blk retval;
+          break :next_options retval;
+        }, null);
+
+        if (options.serialization == .pack and !options.compact_pointers) {
+          @compileLog("options.compact_pointers must be true when options.serialization == .pack\n");
+          break :blk error.MustCompactPointers;
+        }
+
+        opaque {
+          pub const Signature = SerializableSignature{
+            .T = T,
+            .U = U,
+            .DD = []const U.Signature.DD,
+            .static_size = @sizeOf(options.slice_len_type) + if (options.compact_pointers) 0 else switch (options.serialization) {
+              .default, .noalign => @sizeOf(T),
+              .pack => unreachable, // options.compact_pointers must be true when options.serialization = .pack
+            },
+            .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
+          };
+
+          pub const IsSameOld = U.IsSameOld;
+
+          pub fn writeStatic(val: *const T, _bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
+            if (!options.compact_pointers) switch (options.serialization) {
+              .default, .noalign => _bytes[0..@sizeOf(usize)].* = std.mem.toBytes(@as(usize, @bitCast(_bytes[@sizeOf(usize)..].ptr))),
+              .pack => unreachable, // options.compact_pointers must be true when options.serialization = .pack
+            };
+            const bytes = if (!options.compact_pointers) _bytes[0..@sizeOf(options.slice_len_type)] else _bytes;
+            switch (options.serialization) {
+              .default, .noalign => bytes[0..@sizeOf(options.slice_len_type)].* = std.mem.toBytes(@as(options.slice_len_type, @intCast(val.len)))[0..@sizeOf(options.slice_len_type)].*,
+              .pack => std.mem.writePackedInt(options.slice_len_type, bytes, offset, @as(options.slice_len_type, @intCast(val.len)), native_endian),
+            }
+          }
+
+          pub fn getDynamicData(val: *const T) Signature.DD {
+            _ = val;
+            @compileError("NOT IMPLEMENTED");
+          }
+
+          pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD)
+            if (options.compact_pointers) FnReturnType(U.read) else *U {
+            if (options.compact_pointers) return U.read(static, offset, da);
+            return switch (options.serialization) {
+              .default, .noalign => @bitCast(static[0..@sizeOf(usize)].*),
+              .pack => unreachable, // options.compact_pointers must be true when options.serialization = .pack
+            };
+          }
         };
       },
     },
@@ -622,10 +664,10 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
               f.type.writeStatic(&@field(val, f.name), bytes[0..SubMax], offset);
               return switch (options.serialization) {
                 .default => {
-                  bytes[SubMax..][0..@sizeOf(TagInt)].* = @bitCast(f.type.Signature.static_size);
+                  bytes[SubMax..][0..@sizeOf(TagInt)].* = std.mem.toBytes(active_tag);
                 },
                 .noalign => {
-                  bytes[SubMax..][0..std.math.divCeil(comptime_int, @bitSizeOf(TagInt), 8)].* = @bitCast(val.*);
+                  bytes[SubMax..][0..std.math.divCeil(comptime_int, @bitSizeOf(TagInt), 8)].* = std.mem.toBytes(active_tag);
                 },
                 .pack => {
                   const tag_offset = SubMax + offset;
