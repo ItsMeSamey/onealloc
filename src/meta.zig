@@ -134,7 +134,7 @@ fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hint: ?
   };
 }
 
-fn GetSortedFields(fields: anytype, options: ToSerializableOptions) @TypeOf(fields) {
+fn GetSortedFields(fields: anytype, options: ToSerializableOptions) !@TypeOf(fields) {
   const next_options = init: {
     var retval = options;
     retval.recurse -= 1;
@@ -144,7 +144,7 @@ fn GetSortedFields(fields: anytype, options: ToSerializableOptions) @TypeOf(fiel
   const FieldType = std.meta.Child(@TypeOf(fields));
   var fields_array: [fields.len]FieldType = fields[0..fields.len].*;
   for (fields_array) |*f| {
-    f.type = ToSerializableT(f.type, next_options, f.alignment);
+    f.type = try ToSerializableT(f.type, next_options, f.alignment);
     switch (options.serialization) {
       .default => {},
       .noalign => f.alignment = 1,
@@ -305,148 +305,151 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
     .@"struct" => |si| if (options.recurse == 0) if (options.error_on_0_recurse) blk: {
       @compileLog("Cannot deslice type " ++ @typeName(T) ++ " any further as options.recurse is 0\n");
       break :blk error.ErrorOn0Recurse;
-    } else GetDirectSerializableT(T, options) else opaque {
-
+    } else GetDirectSerializableT(T, options) else blk: {
       const UInfo: std.builtin.Type.Struct = .{
         .layout = switch (options.serialization) {
           .default, .noalign => .auto,
           .pack => .@"packed",
         },
-        .fields = GetSortedFields(si.fields, options),
+        .fields = try GetSortedFields(si.fields, options),
         .decls = &.{},
         .is_tuple = si.is_tuple,
       };
 
-      pub const IsSameOld = options.serialization == .default and blk: {
-        for (UInfo.fields, si.fields) |f, s| {
-          if (f.name != s.name or @hasDecl(f.type, "IsSameOld") and !f.type.IsSameOld) break :blk false;
-        }
-        break :blk true;
-      };
-
-      const DDInfo: std.builtin.Type.Struct = .{
-        .layout = .auto,
-        .fields = blk: {
-          var retval: [UInfo.fields.len]std.builtin.Type.StructField = undefined;
-          for (UInfo.fields, 0..) |f, i| {
-            retval[i] = .{
-              .name = f.name,
-              .type = f.type.Signature.DD,
-              .default_value_ptr = null,
-              .is_comptime = false,
-              .alignment = @alignOf(f.type.Signature.DD),
-            };
+      break :blk opaque {
+        pub const IsSameOld = options.serialization == .default and blk: {
+          for (UInfo.fields, si.fields) |f, s| {
+            if (f.name != s.name or @hasDecl(f.type, "IsSameOld") and !f.type.IsSameOld) break :blk false;
           }
-          break :blk &retval;
-        },
-        .decls = &.{},
-        .is_tuple = si.is_tuple,
-      };
+          break :blk true;
+        };
 
-      pub const Signature = SerializableSignature{
-        .T = T,
-        .U = @Type(.{ .@"struct" = UInfo }),
-        .DD = @Type(.{ .@"struct" = DDInfo }),
-        .static_size = switch (options.serialization) {
-          .default, .noalign => @sizeOf(T),
-          .pack => @bitSizeOf(T),
-        },
-        .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
-      };
+        const DDInfo: std.builtin.Type.Struct = .{
+          .layout = .auto,
+          .fields = blk: {
+            var retval: [UInfo.fields.len]std.builtin.Type.StructField = undefined;
+            for (UInfo.fields, 0..) |f, i| {
+              retval[i] = .{
+                .name = f.name,
+                .type = f.type.Signature.DD,
+                .default_value_ptr = null,
+                .is_comptime = false,
+                .alignment = @alignOf(f.type.Signature.DD),
+              };
+            }
+            break :blk &retval;
+          },
+          .decls = &.{},
+          .is_tuple = si.is_tuple,
+        };
 
-      pub fn writeStatic(val: *const T, _bytes: []align(Signature.alignment.toByteUnits()) u8, _offset: if (options.serialization == .pack) u3 else u0) void {
-        var bytes = _bytes;
-        var offset = _offset;
-        inline for (UInfo.fields) |f| {
-          f.type.writeStatic(&@field(val, f.name), bytes, offset);
-          switch (options.serialization) {
-            .default, .noalign => bytes = bytes[Signature.static_size..],
-            .pack => {
-              const new_offset = Signature.static_size + offset;
-              bytes = bytes[new_offset >> 3..];
-              offset = new_offset & 0b111;
+        pub const Signature = SerializableSignature{
+          .T = T,
+          .U = @Type(.{ .@"struct" = UInfo }),
+          .DD = @Type(.{ .@"struct" = DDInfo }),
+          .static_size = switch (options.serialization) {
+            .default, .noalign => @sizeOf(T),
+            .pack => @bitSizeOf(T),
+          },
+          .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
+        };
+
+        pub fn writeStatic(val: *const T, _bytes: []align(Signature.alignment.toByteUnits()) u8, _offset: if (options.serialization == .pack) u3 else u0) void {
+          var bytes = _bytes;
+          var offset = _offset;
+          inline for (UInfo.fields) |f| {
+            f.type.writeStatic(&@field(val, f.name), bytes, offset);
+            switch (options.serialization) {
+              .default, .noalign => bytes = bytes[Signature.static_size..],
+              .pack => {
+                const new_offset = Signature.static_size + offset;
+                bytes = bytes[new_offset >> 3..];
+                offset = new_offset & 0b111;
+              }
             }
           }
         }
-      }
 
-      pub fn getDynamicData(val: *const T) Signature.DD {
-        var retval: Signature.DD = undefined;
-        for (UInfo.fields) |f| @field(retval, f.name) = f.type.getDynamicData(&@field(val, f.name));
-        return retval;
-      }
+        pub fn getDynamicData(val: *const T) Signature.DD {
+          var retval: Signature.DD = undefined;
+          for (UInfo.fields) |f| @field(retval, f.name) = f.type.getDynamicData(&@field(val, f.name));
+          return retval;
+        }
 
-      pub const StructIterator = struct {
-        da: Signature.DD,
-        static: []align(Signature.alignment.toByteUnits()) u8,
-        offset: if (options.serialization == .pack) u3 else u0 = 0,
+        pub const StructIterator = struct {
+          da: Signature.DD,
+          static: []align(Signature.alignment.toByteUnits()) u8,
+          offset: if (options.serialization == .pack) u3 else u0 = 0,
 
-        pub fn get(self: @This(), comptime name: []const u8) T {
-          return @field(self.static[0..Signature.static_size], name);
+          pub fn get(self: @This(), comptime name: []const u8) T {
+            return @field(self.static[0..Signature.static_size], name);
+          }
+        };
+
+        pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) StructIterator {
+          return .{ .static = static, .offset = offset, .da = da, };
         }
       };
-
-      pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) StructIterator {
-        return .{ .static = static, .offset = offset, .da = da, };
-      }
     },
-    .optional => |oi| opaque {
-      const U = ToSerializableT(union(enum) { None: void, Some: oi.child }, options, align_hint);
-
-      pub const Signature = SerializableSignature{
-        .T = T,
-        .U = U,
-        .DD = U.Signature.DD,
-        .static_size = U.Signature.static_size,
-        .alignment = U.Signature.alignment,
-      };
-      pub const IsSameOld = U.IsSameOld;
-
-      pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
-        const u = @unionInit(Signature.U.Signature.T, if (val.*) "Some" else "None", if (val.*) |v| v else {});
-        U.writeStatic(&u, bytes, offset);
-      }
-
-      pub fn getDynamicData(val: *const T) Signature.DD {
-        const u = @unionInit(Signature.U.Signature.T, if (val.*) "Some" else "None", if (val.*) |v| v else {});
-        return U.getDynamicData(&u);
-      }
-
-      pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) T {
-        return switch (U.read(static, offset, da)) {
-          .None => null,
-          .Some => |v| v,
+    .optional => |oi| blk: {
+      const U = try ToSerializableT(union(enum) { None: void, Some: oi.child }, options, align_hint);
+      break :blk opaque {
+        pub const Signature = SerializableSignature{
+          .T = T,
+          .U = U,
+          .DD = U.Signature.DD,
+          .static_size = U.Signature.static_size,
+          .alignment = U.Signature.alignment,
         };
-      }
+        pub const IsSameOld = U.IsSameOld;
+
+        pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
+          const u = @unionInit(Signature.U.Signature.T, if (val.*) "Some" else "None", if (val.*) |v| v else {});
+          U.writeStatic(&u, bytes, offset);
+        }
+
+        pub fn getDynamicData(val: *const T) Signature.DD {
+          const u = @unionInit(Signature.U.Signature.T, if (val.*) "Some" else "None", if (val.*) |v| v else {});
+          return U.getDynamicData(&u);
+        }
+
+        pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) T {
+          return switch (U.read(static, offset, da)) {
+            .None => null,
+            .Some => |v| v,
+          };
+        }
+      };
     },
-    .error_union => |ei| opaque {
-      const U = ToSerializableT(union(enum) { Err: ei.error_set, Some: ei.payload }, options, align_hint);
-
-      pub const Signature = SerializableSignature{
-        .T = T,
-        .U = U,
-        .DD = U.Signature.DD,
-        .static_size = U.Signature.static_size,
-        .alignment = U.Signature.alignment,
-      };
-      pub const IsSameOld = U.IsSameOld;
-
-      pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
-        const u = @unionInit(Signature.U.Signature.T, if (std.meta.isError(val.*)) "Err" else "Ok", val.* catch |e| e);
-        U.writeStatic(&u, bytes, offset);
-      }
-
-      pub fn getDynamicData(val: *const T) Signature.DD {
-        const u = @unionInit(Signature.U.Signature.T, if (std.meta.isError(val.*)) "Err" else "Ok", val.* catch |e| e);
-        return U.getDynamicData(&u);
-      }
-
-      pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) T {
-        return switch (U.read(static, offset, da)) {
-          .Err => |e| e,
-          .Some => |v| v,
+    .error_union => |ei| blk: {
+      const U = try ToSerializableT(union(enum) { Err: ei.error_set, Some: ei.payload }, options, align_hint);
+      break :blk opaque {
+        pub const Signature = SerializableSignature{
+          .T = T,
+          .U = U,
+          .DD = U.Signature.DD,
+          .static_size = U.Signature.static_size,
+          .alignment = U.Signature.alignment,
         };
-      }
+        pub const IsSameOld = U.IsSameOld;
+
+        pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
+          const u = @unionInit(Signature.U.Signature.T, if (std.meta.isError(val.*)) "Err" else "Ok", val.* catch |e| e);
+          U.writeStatic(&u, bytes, offset);
+        }
+
+        pub fn getDynamicData(val: *const T) Signature.DD {
+          const u = @unionInit(Signature.U.Signature.T, if (std.meta.isError(val.*)) "Err" else "Ok", val.* catch |e| e);
+          return U.getDynamicData(&u);
+        }
+
+        pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) T {
+          return switch (U.read(static, offset, da)) {
+            .Err => |e| e,
+            .Some => |v| v,
+          };
+        }
+      };
     },
     .@"enum" => |ei| if (ei.is_exhaustive or (options.shrink_enum and @bitSizeOf(T) == std.math.log2_int_ceil(usize, ei.fields.len))) blk: {
       break :blk GetDirectSerializableT(T, options, align_hint);
@@ -509,7 +512,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
     } else if (options.recurse == 0) if (options.error_on_0_recurse) blk: {
       @compileLog("Cannot deslice type " ++ @typeName(T) ++ " any further as options.recurse is 0\n");
       break :blk error.ErrorOn0Recurse;
-    } else GetDirectSerializableT(T, options) else opaque {
+    } else GetDirectSerializableT(T, options) else blk: {
       // WARNING: We store tag after the union data, this is what zig seems to do as well but is likely not guaranteed.
       const TagType = ui.tag_type.?;
       const UInfo: std.builtin.Type.Union = .{
@@ -518,106 +521,109 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
           .pack => .@"packed",
         },
         .tag_type = TagType,
-        .fields = GetSortedFields(ui.fields, options),
+        .fields = try GetSortedFields(ui.fields, options),
         .decls = &.{},
       };
 
-      pub const IsSameOld = options.serialization == .default and blk: {
-        for (UInfo.fields, ui.fields) |f, s| {
-          if (f.name != s.name or @hasDecl(f.type, "IsSameOld") and !f.type.IsSameOld) break :blk false;
-        }
-        break :blk true;
-      };
-
-      const DDInfo: std.builtin.Type.Union = .{
-        .layout = .auto,
-        .tag_type = TagType,
-        .fields = blk: {
-          var retval: [UInfo.fields.len]std.builtin.Type.StructField = undefined;
-          for (UInfo.fields, 0..) |f, i| {
-            retval[i] = .{
-              .name = f.name,
-              .type = f.type.Signature.DD,
-              .default_value_ptr = null,
-              .is_comptime = false,
-              .alignment = @alignOf(f.type.Signature.DD),
-            };
+      break :blk opaque {
+        pub const IsSameOld = options.serialization == .default and blk: {
+          for (UInfo.fields, ui.fields) |f, s| {
+            if (f.name != s.name or @hasDecl(f.type, "IsSameOld") and !f.type.IsSameOld) break :blk false;
           }
-          break :blk &retval;
-        },
-        .decls = &.{},
-      };
+          break :blk true;
+        };
 
-      const SubMax = blk: {
-        var max = 0;
-        for (UInfo.fields) |f| max = @max(max, f.type.Signature.static_size);
-        break :blk max;
-      };
-      const Signature = SerializableSignature{
-        .T = T,
-        .U = @Type(.{ .@"union" = UInfo }),
-        .DD = @Type(.{ .@"union" = DDInfo }),
-        .static_size = switch (options.serialization) {
-          .default => if (IsSameOld) @sizeOf(T),
-          else => SubMax + (if (options.serialization == .noalign) std.math.divCeil(comptime_int, @bitSizeOf(TagType), 8) else @bitSizeOf(TagType)),
-        },
-        .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
-      };
-
-      const SizedInt = std.meta.Int(.unsigned, Signature.static_size);
-      const TagInt = std.meta.Tag(TagType);
-
-      pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
-        const active_tag = std.meta.activeTag(val.*);
-        inline for (UInfo.fields) |f| {
-          const ftag = comptime std.meta.stringToEnum(TagType, f.name);
-          if (ftag == active_tag) {
-            f.type.writeStatic(&@field(val, f.name), bytes[0..SubMax], offset);
-            return switch (options.serialization) {
-              .default => {
-                bytes[SubMax..][0..@sizeOf(TagInt)].* = @bitCast(f.type.Signature.static_size);
-              },
-              .noalign => {
-                bytes[SubMax..][0..std.math.divCeil(comptime_int, @bitSizeOf(TagInt), 8)].* = @bitCast(val.*);
-              },
-              .pack => {
-                const tag_offset = SubMax + offset;
-                const _bytes = bytes[tag_offset >> 3..];
-                const _offset = tag_offset & 0b111;
-                std.mem.writePackedInt(TagInt, _bytes, _offset, @bitCast(f.type.Signature.static_size), native_endian);
-              }
-            };
-          }
-        }
-        unreachable;
-      }
-
-      pub fn getDynamicData(val: *const T) Signature.DD {
-        const active_tag = std.meta.activeTag(val.*);
-        inline for (UInfo.fields) |f| {
-          const ftag = comptime std.meta.stringToEnum(TagType, f.name);
-          if (ftag == active_tag) return @unionInit(Signature.DD, f.name, f.type.getDynamicData(&@field(val, f.name)));
-        }
-        unreachable;
-      }
-
-      pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) Signature.U {
-        const active_tag: TagType = @enumFromInt(switch (options.serialization) {
-          .default => @as(TagInt, @bitCast(static[SubMax..][0..@sizeOf(TagInt)])),
-          .noalign => @as(TagInt, @bitCast(static[SubMax..][0..std.math.divCeil(comptime_int, @bitSizeOf(TagInt), 8)])),
-          .pack => blk: {
-            const tag_offset = SubMax + offset;
-            const _static = static[tag_offset >> 3..];
-            const _offset = tag_offset & 0b111;
-            break :blk std.mem.readPackedInt(SizedInt, _static, _offset, native_endian);
+        const DDInfo: std.builtin.Type.Union = .{
+          .layout = .auto,
+          .tag_type = TagType,
+          .fields = blk: {
+            var retval: [UInfo.fields.len]std.builtin.Type.StructField = undefined;
+            for (UInfo.fields, 0..) |f, i| {
+              retval[i] = .{
+                .name = f.name,
+                .type = f.type.Signature.DD,
+                .default_value_ptr = null,
+                .is_comptime = false,
+                .alignment = @alignOf(f.type.Signature.DD),
+              };
+            }
+            break :blk &retval;
           },
-        });
-        inline for (UInfo.fields) |f| {
-          const ftag = comptime std.meta.stringToEnum(TagType, f.name);
-          if (ftag == active_tag) return @unionInit(Signature.U, f.name, f.type.read(static[0..SubMax], offset, da));
+          .decls = &.{},
+        };
+
+        const SubMax = blk: {
+          var max = 0;
+          for (UInfo.fields) |f| max = @max(max, f.type.Signature.static_size);
+          break :blk max;
+        };
+
+        pub const Signature = SerializableSignature{
+          .T = T,
+          .U = @Type(.{ .@"union" = UInfo }),
+          .DD = @Type(.{ .@"union" = DDInfo }),
+          .static_size = switch (options.serialization) {
+            .default => if (IsSameOld) @sizeOf(T),
+            else => SubMax + (if (options.serialization == .noalign) std.math.divCeil(comptime_int, @bitSizeOf(TagType), 8) else @bitSizeOf(TagType)),
+          },
+          .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
+        };
+
+        const SizedInt = std.meta.Int(.unsigned, Signature.static_size);
+        const TagInt = std.meta.Tag(TagType);
+
+        pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
+          const active_tag = std.meta.activeTag(val.*);
+          inline for (UInfo.fields) |f| {
+            const ftag = comptime std.meta.stringToEnum(TagType, f.name);
+            if (ftag == active_tag) {
+              f.type.writeStatic(&@field(val, f.name), bytes[0..SubMax], offset);
+              return switch (options.serialization) {
+                .default => {
+                  bytes[SubMax..][0..@sizeOf(TagInt)].* = @bitCast(f.type.Signature.static_size);
+                },
+                .noalign => {
+                  bytes[SubMax..][0..std.math.divCeil(comptime_int, @bitSizeOf(TagInt), 8)].* = @bitCast(val.*);
+                },
+                .pack => {
+                  const tag_offset = SubMax + offset;
+                  const _bytes = bytes[tag_offset >> 3..];
+                  const _offset = tag_offset & 0b111;
+                  std.mem.writePackedInt(TagInt, _bytes, _offset, @bitCast(f.type.Signature.static_size), native_endian);
+                }
+              };
+            }
+          }
+          unreachable;
         }
-        unreachable;
-      }
+
+        pub fn getDynamicData(val: *const T) Signature.DD {
+          const active_tag = std.meta.activeTag(val.*);
+          inline for (UInfo.fields) |f| {
+            const ftag = comptime std.meta.stringToEnum(TagType, f.name);
+            if (ftag == active_tag) return @unionInit(Signature.DD, f.name, f.type.getDynamicData(&@field(val, f.name)));
+          }
+          unreachable;
+        }
+
+        pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) Signature.U {
+          const active_tag: TagType = @enumFromInt(switch (options.serialization) {
+            .default => @as(TagInt, @bitCast(static[SubMax..][0..@sizeOf(TagInt)])),
+            .noalign => @as(TagInt, @bitCast(static[SubMax..][0..std.math.divCeil(comptime_int, @bitSizeOf(TagInt), 8)])),
+            .pack => blk: {
+              const tag_offset = SubMax + offset;
+              const _static = static[tag_offset >> 3..];
+              const _offset = tag_offset & 0b111;
+              break :blk std.mem.readPackedInt(SizedInt, _static, _offset, native_endian);
+            },
+          });
+          inline for (UInfo.fields) |f| {
+            const ftag = comptime std.meta.stringToEnum(TagType, f.name);
+            if (ftag == active_tag) return @unionInit(Signature.U, f.name, f.type.read(static[0..SubMax], offset, da));
+          }
+          unreachable;
+        }
+      };
     },
     .@"opaque" => if (@hasDecl(T, "Signature") and @TypeOf(@field(T, "Signature")) == SerializableSignature) T else blk: {
       @compileLog("A non-serializable opaque " ++ @typeName(T) ++ " was provided to `ToSerializableT`\n");
