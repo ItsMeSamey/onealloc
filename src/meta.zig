@@ -514,21 +514,35 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
           U.writeStatic(&u, bytes, offset);
         }
 
-        pub fn getDynamicSize(val: *const T) usize {
+        pub fn _getDynamicSize(val: *const T) usize {
           return if (val.*) |v| Underlying.getDynamicSize(&v) else 0;
         }
 
-        pub fn writeDynamic(val: *const T, bytes: []u8) usize {
+        pub fn _writeDynamic(val: *const T, bytes: []u8) usize {
           return if (val.*) |v| Underlying.writeDynamic(&v, bytes) else 0;
         }
 
+        pub const getDynamicSize = if (U.IsStatic) void else _getDynamicSize;
+        pub const writeDynamic = if (U.IsStatic) void else _writeDynamic;
         pub const readDynamicSize = U.readDynamicSize;
 
-        pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) ?Underlying {
-          return switch (U.read(static, offset, dynamic)) {
-            .None => null,
-            .Some => |v| v,
-          };
+        pub const GS = struct {
+          underlying: U.GS,
+
+          pub fn get(self: @This()) ?Underlying {
+            return switch (self.underlying.get()) {
+              .none => null,
+              .some => |v| v,
+            };
+          }
+
+          pub fn set(self: @This(), val: ?Underlying) void {
+            writeStatic(&val, self.underlying.bytes, self.underlying.offset);
+          }
+        };
+
+        pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) GS {
+          return .{ .underlying = .{ .static = static, .dynamic = dynamic, .offset = offset } };
         }
       };
     },
@@ -549,21 +563,35 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
           U.writeStatic(&u, bytes, offset);
         }
 
-        pub fn getDynamicSize(val: *const T) usize {
+        pub fn _getDynamicSize(val: *const T) usize {
           return if (!std.meta.isError(val.*)) Underlying.getDynamicSize(&(val.* catch unreachable)) else 0;
         }
 
-        pub fn writeDynamic(val: *const T, bytes: []u8) usize {
+        pub fn _writeDynamic(val: *const T, bytes: []u8) usize {
           return if (!std.meta.isError(val.*)) Underlying.writeDynamic(&(val.* catch unreachable), bytes) else 0;
         }
 
+        pub const getDynamicSize = if (U.IsStatic) void else _getDynamicSize;
+        pub const writeDynamic = if (U.IsStatic) void else _writeDynamic;
         pub const readDynamicSize = U.readDynamicSize;
 
-        pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) ei.error_set!U.Signature.U {
-          return switch (U.read(static, offset, dynamic)) {
-            .Err => |e| e,
-            .Some => |v| v,
-          };
+        pub const GS = struct {
+          underlying: U.GS,
+
+          pub fn get(self: @This()) ei.error_set!U.Signature.U {
+            return switch (self.underlying.get()) {
+              .err => |e| e,
+              .some => |v| v,
+            };
+          }
+
+          pub fn set(self: @This(), val: ei.error_set!U.Signature.U) void {
+            writeStatic(&val, self.underlying.bytes, self.underlying.offset);
+          }
+        };
+
+        pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) GS {
+          return .{ .underlying = .{ .static = static, .dynamic = dynamic, .offset = offset } };
         }
       };
     },
@@ -601,7 +629,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
         }
       }
 
-      const WrappedGetterSetter = struct {
+      pub const GS = struct {
         underlying: GetterSetter(Signature.U, options, align_hint),
 
         pub fn get(self: @This()) T {
@@ -613,8 +641,8 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
         }
       };
 
-      pub fn read(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, _: []const u8) WrappedGetterSetter {
-        return .{ .bytes = static, .offset = offset };
+      pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, _: []u8) GS {
+        return .{ .underlying = .{ .bytes = static, .offset = offset } };
       }
     },
     .@"union" => |ui| if (ui.tag_type == null) blk: {
@@ -718,9 +746,9 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
         pub const writeDynamic = if (IsStatic) void else _writeDynamic;
         pub const readDynamicSize = if (IsStatic) void else _readDynamicSize;
 
-        const GS = struct {
+        pub const GS = struct {
           static: []u8,
-          dynamic: []const u8,
+          dynamic: []u8,
           offset: if (options.serialization == .pack) u3 else u0 = 0,
 
           fn activeTag(self: @This()) TagType {
@@ -749,7 +777,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
           }
         };
 
-        pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) GS {
+        pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) GS {
           return .{ .static = static, .dynamic = dynamic, .offset = offset };
         }
       };
