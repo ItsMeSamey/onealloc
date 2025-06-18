@@ -35,6 +35,8 @@ pub const SerializableSignature = struct {
   pub const EmptyDD = struct {};
 };
 
+pub const IteratorSignature = struct {};
+
 /// Control how serialization of the type is done
 pub const ToSerializableOptions = struct {
   /// The type that is to be deserialized
@@ -51,6 +53,9 @@ pub const ToSerializableOptions = struct {
   /// NOTE: You should ideally use, `GetShrunkEnumType` function when declaring structs themselves
   ///   because this has a runtime cost
   shrink_enum: bool = true,
+  /// When set to true, pointer to something is treated as that thing. This is recommended to keep on as it no overhead.
+  /// This MUST be true when using .serialization = .pack
+  compact_pointers: bool = true,
   /// If set to true, serialize a Many / C / anyopaque pointer as a uint, otherwise throw a compileError
   serialize_unknown_pointer_as_usize: bool = true,
   /// Type given to the `len` argument of slices.
@@ -58,7 +63,7 @@ pub const ToSerializableOptions = struct {
   ///   Your choice will still be respected though
   slice_len_type: type = usize,
   /// Make all the sub structs `Serializable` as well with the same config if they are not already
-  /// If this is 0, Sub structs / unions / error!unions / ?optional (excluding optional ?*pointers) won't be analyzed,
+  /// If this is 0, Sub structs / unions / error!unions / ?optional (even ?*optional_pointer) won't be analyzed,
   ///   Their serializer will write just their raw bytes and nothing else
   /// A reasonably large number is chosen as a default
   recurse: comptime_int = 1024,
@@ -124,7 +129,7 @@ fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hint: ?
       return .{};
     }
 
-    pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, _: Signature.DD) T {
+    pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, _: Signature.DD) Signature.U {
       if (I == u0) return;
       return @bitCast(switch (options.serialization) {
         .default, .noalign => std.mem.readInt(I, static[0..Signature.static_size], native_endian),
@@ -135,16 +140,15 @@ fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hint: ?
 }
 
 fn GetSortedFields(fields: anytype, options: ToSerializableOptions) !@TypeOf(fields) {
-  const next_options = init: {
-    var retval = options;
-    retval.recurse -= 1;
-    break :init retval;
-  };
-
   const FieldType = std.meta.Child(@TypeOf(fields));
   var fields_array: [fields.len]FieldType = fields[0..fields.len].*;
   for (fields_array) |*f| {
-    f.type = try ToSerializableT(f.type, next_options, f.alignment);
+    f.type = try ToSerializableT(f.type, init: {
+      var retval = options;
+      retval.recurse -= 1;
+      break :init retval;
+    }, f.alignment);
+
     switch (options.serialization) {
       .default => {},
       .noalign => f.alignment = 1,
@@ -202,31 +206,65 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
       @compileLog("Type '" ++ @tagName(std.meta.activeTag(@typeInfo(T))) ++ "' is non serializable\n");
       break :blk error.NonSerializableType;
     },
-    .void, .bool, .int, .float, .vector => GetDirectSerializableT(T, options),
-    .pointer => |pi| if (options.dereference == 0) GetDirectSerializableT(T, options) else switch (pi.size) {
-      .many, .c => if (options.serialize_unknown_pointer_as_usize) GetDirectSerializableT(T, options) else blk: {
+    .void, .bool, .int, .float, .vector => GetDirectSerializableT(T, options, align_hint),
+    .pointer => |pi| if (options.dereference == 0) GetDirectSerializableT(T, options, align_hint) else switch (pi.size) {
+      .many, .c => if (options.serialize_unknown_pointer_as_usize) GetDirectSerializableT(T, options, align_hint) else blk: {
         @compileLog(@tagName(pi.size) ++ " pointer cannot be serialized for type " ++ @typeName(T) ++ ", consider setting serialize_many_pointer_as_usize to true\n");
         break :blk error.NonSerializablePointerType;
       },
       .one => if (options.dereference == 0) if (options.error_on_0_dereference) blk: {
         @compileLog("Cannot dereference type " ++ @typeName(T) ++ " any further as options.dereference is 0\n");
         break :blk error.ErrorOn0Dereference;
-      } else opaque {
-        const next_options = blk: {
+      } else GetDirectSerializableT(T, options, align_hint) else blk: {
+        const U = try ToSerializableT(T, next_options: {
           var retval = options;
           retval.dereference -= 1;
-          break :blk retval;
-        };
+          break :next_options retval;
+        }, null);
 
-        pub const Signature = SerializableSignature{
-          .T = T,
-          .U = T,
-          .DD = Signature.EmptyDD,
-          .static_size = switch (options.serialization) {
-            .default, .noalign => @sizeOf(T),
-            .pack => @bitSizeOf(T),
-          },
-          .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
+        if (options.serialization == .pack and !options.compact_pointers) {
+          @compileLog("options.compact_pointers must be true when options.serialization == .pack\n");
+          break :blk error.MustCompactPointers;
+        }
+
+        break :blk opaque {
+          pub const Signature = SerializableSignature{
+            .T = T,
+            .U = U.Signature.U,
+            .DD = U.Signature.DD,
+            .static_size = U.Signature.static_size + if (options.compact_pointers) 0 else switch (options.serialization) {
+              .default, .noalign => @sizeOf(T),
+              .pack => unreachable, // options.compact_pointers must be true when options.serialization = .pack
+            },
+            .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
+          };
+
+          pub const IsSameOld = U.IsSameOld;
+
+          pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
+            U.writeStatic(&val.*, bytes, offset);
+            if (options.compact_pointers) return;
+            switch (options.serialization) {
+              .default, .noalign => {
+                bytes[0..@sizeOf(usize)].* = @as(usize, @bitCast(bytes[@sizeOf(usize)..].ptr));
+                U.writeStatic(&val.*, bytes[Signature.static_size..], offset);
+              },
+              .pack => unreachable, // options.compact_pointers must be true when options.serialization = .pack
+            }
+          }
+
+          pub fn getDynamicData(val: *const T) Signature.DD {
+            return U.getDynamicData(&val.*);
+          }
+
+          pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD)
+            if (options.compact_pointers) FnReturnType(U.read) else *U {
+            if (options.compact_pointers) return U.read(static, offset, da);
+            return switch (options.serialization) {
+              .default, .noalign => @bitCast(static[0..@sizeOf(usize)].*),
+              .pack => unreachable, // options.compact_pointers must be true when options.serialization = .pack
+            };
+          }
         };
       },
       .slice => if (options.deslice == 0) if (options.error_on_0_deslice) blk: {
@@ -289,6 +327,8 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
         static: []align(Signature.alignment.toByteUnits()) u8,
         offset: if (options.serialization == .pack) u3 else u0 = 0,
 
+        pub const Iterator = IteratorSignature{};
+
         pub fn get(self: @This(), i: std.math.IntFittingRange(0, ai.len)) U {
           return switch (options.serialization) {
             .default, .noalign => U.read(self.static[i * Signature.static_size..], self.offset, self.da),
@@ -305,7 +345,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
     .@"struct" => |si| if (options.recurse == 0) if (options.error_on_0_recurse) blk: {
       @compileLog("Cannot deslice type " ++ @typeName(T) ++ " any further as options.recurse is 0\n");
       break :blk error.ErrorOn0Recurse;
-    } else GetDirectSerializableT(T, options) else blk: {
+    } else GetDirectSerializableT(T, options, align_hint) else blk: {
       const UInfo: std.builtin.Type.Struct = .{
         .layout = switch (options.serialization) {
           .default, .noalign => .auto,
@@ -381,6 +421,8 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
           static: []align(Signature.alignment.toByteUnits()) u8,
           offset: if (options.serialization == .pack) u3 else u0 = 0,
 
+          pub const Iterator = IteratorSignature{};
+
           pub fn get(self: @This(), comptime name: []const u8) T {
             return @field(self.static[0..Signature.static_size], name);
           }
@@ -413,7 +455,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
           return U.getDynamicData(&u);
         }
 
-        pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) T {
+        pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) ?U.Signature.U {
           return switch (U.read(static, offset, da)) {
             .None => null,
             .Some => |v| v,
@@ -443,7 +485,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
           return U.getDynamicData(&u);
         }
 
-        pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) T {
+        pub fn read(static: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0, da: Signature.DD) ei.error_set!U.Signature.U {
           return switch (U.read(static, offset, da)) {
             .Err => |e| e,
             .Some => |v| v,
@@ -512,7 +554,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
     } else if (options.recurse == 0) if (options.error_on_0_recurse) blk: {
       @compileLog("Cannot deslice type " ++ @typeName(T) ++ " any further as options.recurse is 0\n");
       break :blk error.ErrorOn0Recurse;
-    } else GetDirectSerializableT(T, options) else blk: {
+    } else GetDirectSerializableT(T, options, align_hint) else blk: {
       // WARNING: We store tag after the union data, this is what zig seems to do as well but is likely not guaranteed.
       const TagType = ui.tag_type.?;
       const UInfo: std.builtin.Type.Union = .{
