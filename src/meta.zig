@@ -41,10 +41,8 @@ pub const ToSerializableOptions = struct {
   T: type,
   /// Control how value bytes are serialized
   serialization: SerializationOptions = .default,
-  /// Type given to the `len` argument of slices.
-  /// NOTE: It is useless to change this unless you are using non-default serialization as well
-  ///   Your choice will still be respected though
-  slice_len_type: type = usize,
+  /// It is highly recommended to keep this on unless you have a REALLY good reason to turn it off
+  sort_fields: bool = true,
   /// If int is supplied, this does nothing at all. If enum supplied is non-exhaustive
   /// and smallest int needed to represent all of its fields is smaller then one used,
   /// the enum fields will be remapped to optimize for size
@@ -53,12 +51,26 @@ pub const ToSerializableOptions = struct {
   /// NOTE: You should ideally use, `GetShrunkEnumType` function when declaring structs themselves
   ///   because this has a runtime cost
   shrink_enum: bool = true,
-  /// Split and reserialize array values according to serialization. This does nothing if it doesn't have to.
-  /// This has no effect with serialization = .default or if array elements have no padding after serialization.
-  reserialize_array: bool = true,
+  /// Optionals take less space when they are null but you can't change their value after initialization
+  /// Has effect only if optional's size > child size (has no effect on pointers for example)
+  dynamic_optionals: bool = false,
+  /// Unions take less space when a smaller than maximum sized union is selected, you cant change their value type after initialization
+  /// This has no effect if the union is not tagged or has equal sized options
+  dynamic_unions: bool = false,
+  /// Nullable pointers take less space when they are null but you can't change their value from null to non-null or non-null to null after initialization
+  dynamic_nullable_pointers: bool = false,
+  /// Error unions take less space if one of the type is smaller, but you cant change the type afterwards.
+  /// This has no 
+  dynamic_error_unions: bool = false,
+  /// If set to true, serialize a Many / C / anyopaque pointer as a uint, otherwise throw a compileError
+  serialize_unknown_pointer_as_usize: bool = true,
+  /// Type given to the `len` argument of slices.
+  /// NOTE: It is useless to change this unless you are using non-default serialization as well
+  ///   Your choice will still be respected though
+  slice_len_type: type = usize,
   /// Make all the sub structs `Serializable` as well with the same config if they are not already
-  /// If this is 0, Sub structs / unions / error!unions / optional (excluding optional pointers) won't be analyzed,
-  ///   Their serializer will just write out their raw bytes only
+  /// If this is 0, Sub structs / unions / error!unions / ?optional (excluding optional ?*pointers) won't be analyzed,
+  ///   Their serializer will write just their raw bytes and nothing else
   /// A reasonably large number is chosen as a default
   recurse: comptime_int = 1024,
   /// Error if recurse = 0
@@ -78,16 +90,6 @@ pub const ToSerializableOptions = struct {
   deslice: comptime_int = 1,
   /// Error if deslice = 0
   error_on_0_deslice: bool = false,
-  /// Optionals take less space when they are null but you can't change their value after initialization
-  /// Has effect only if optional's size > child size (has no effect on pointers for example)
-  dynamic_optionals: bool = false,
-  /// Unions take less space when a smaller than maximum sized union is selected, you cant change their value after initialization
-  /// This has no effect if the union is not tagged or has equal sized options
-  dynamic_unions: bool = false,
-  /// If set to true, serialize a Many / C pointer as a uint, otherwise throw a compileError
-  serialize_many_pointer_as_usize: bool = true,
-  /// It is highly recommended to keep this on unless you have a REALLY good reason to turn it off
-  sort_fields: bool = true,
 
   pub const SerializationOptions = enum {
     ///stuffs together like in packed struct, 2 u22's take up 44 bits
@@ -142,20 +144,6 @@ fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hint: ?
   };
 }
 
-fn GetSerializablePointer(Child: type, options: ToSerializableOptions) type {
-  _ = .{ Child, options };
-  return opaque {
-
-  };
-}
-
-fn GetSerializableSlice(Child: type, options: ToSerializableOptions) type {
-  _ = .{ Child, options };
-  return opaque {
-
-  };
-}
-
 /// Shrink the enum type, if return type of this function is used, enum is guaranteed to not be shrunk (it is already shrunk)
 /// You can get the original enum value using `@enumFromInt(@typeInfo(OriginalEnumType).@"enum".fields[@intFromEnum(val)])`
 pub fn GetShrunkEnumType(T: type) type {
@@ -181,28 +169,6 @@ pub fn GetShrunkEnumType(T: type) type {
   });
 }
 
-// const CanSerializeResult = enum {
-//   /// type can definitely be serialized
-//   yes,
-//   /// Type may be serializable
-//   maybe,
-//   /// Type is non serializable
-//   no,
-//   /// Cant deserialize due to depth limitations
-//   depth_exceeded,
-// };
-// pub fn canSerialize(T: type, options: ToSerializableOptions) CanSerializeResult {
-//   switch (@typeInfo(T)) {
-//     .type, .noreturn, .comptime_int, .comptime_float, .undefined, .null, .error_set, .@"fn", .frame, .@"anyframe", .enum_literal => .no,
-//     .void, .bool, .int, .float, .vector => .yes,
-//     .pointer => |pi| switch (pi) {
-//       .one, .slice => .maybe,
-//       .many, .c => if (options.serialize_many_pointer_as_usize) .yes else .no,
-//     },
-//     else => true
-//   }
-// }
-
 /// We return an error instead of calling @compileError directly because we want to give the user a stacktrace
 fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem.Alignment) anyerror!type {
   return switch (@typeInfo(T)) {
@@ -212,31 +178,29 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
     },
     .void, .bool, .int, .float, .vector => GetDirectSerializableT(T, options),
     .pointer => |pi| if (options.dereference == 0) GetDirectSerializableT(T, options) else switch (pi.size) {
-      .many, .c => if (options.serialize_many_pointer_as_usize) GetDirectSerializableT(T, options) else blk: {
+      .many, .c => if (options.serialize_unknown_pointer_as_usize) GetDirectSerializableT(T, options) else blk: {
         @compileLog(@tagName(pi.size) ++ " pointer cannot be serialized for type " ++ @typeName(T) ++ ", consider setting serialize_many_pointer_as_usize to true\n");
         break :blk error.NonSerializablePointerType;
       },
-      .one => blk: {
-        if (options.dereference == 0) {
-          if (options.error_on_0_dereference) {
-            @compileLog("Cannot dereference type " ++ @typeName(T) ++ " any further as options.dereference is 0\n");
-            break :blk error.ErrorOn0Dereference;
-          }
-        }
-        comptime var next_op = options;
-        next_op.dereference -= 1;
-        break :blk GetSerializablePointer(pi.child, next_op);
+      .one => if (options.dereference == 0) if (options.error_on_0_dereference) blk: {
+        @compileLog("Cannot dereference type " ++ @typeName(T) ++ " any further as options.dereference is 0\n");
+        break :blk error.ErrorOn0Dereference;
+      } else opaque {
+        const next_options = blk: {
+          var retval = options;
+          retval.dereference -= 1;
+          break :blk retval;
+        };
       },
-      .slice => blk: {
-        if (options.deslice == 0) {
-          if (options.error_on_0_deslice) {
-            @compileLog("Cannot deslice type " ++ @typeName(T) ++ " any further as options.dereference is 0\n");
-            break :blk error.ErrorOn0Dereference;
-          }
-        }
-        comptime var next_op = options;
-        next_op.deslice -= 1;
-        break :blk GetSerializableSlice(pi.child, next_op);
+      .slice => if (options.deslice == 0) if (options.error_on_0_deslice) blk: {
+        @compileLog("Cannot deslice type " ++ @typeName(T) ++ " any further as options.dereference is 0\n");
+        break :blk error.ErrorOn0Dereference;
+      } else opaque {
+        const next_options = blk: {
+          var retval = options;
+          retval.deslice -= 1;
+          break :blk retval;
+        };
       },
     },
     .array => |ai| opaque {
@@ -301,8 +265,11 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
         return .{ .static = static, .offset = offset, .da = da, };
       }
     },
-    .@"struct" => |si| if (options.recurse == 0) GetDirectSerializableT(T, options) else opaque {
-      const sub_options = init: {
+    .@"struct" => |si| if (options.recurse == 0) if (options.error_on_0_recurse) blk: {
+      @compileLog("Cannot deslice type " ++ @typeName(T) ++ " any further as options.recurse is 0\n");
+      break :blk error.ErrorOn0Recurse;
+    } else GetDirectSerializableT(T, options) else opaque {
+      const next_options = init: {
         var retval = options;
         retval.recurse -= 1;
         break :init retval;
@@ -318,7 +285,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
           if (!options.sort_fields) break :blk si.fields;
           var fields_array: [si.fields.len]std.builtin.Type.StructField = si.fields[0..si.fields.len].*;
           for (fields_array) |*f| {
-            f.type = ToSerializableT(T, sub_options, f.alignment);
+            f.type = ToSerializableT(T, next_options, f.alignment);
             switch (options.serialization) {
               .default => {},
               .noalign => f.alignment = 1,
@@ -481,7 +448,8 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
         return if (IsSameOld) val else @enumFromInt(@typeInfo(T).@"enum".fields[@intFromEnum(val)]);
       }
     },
-    .@"union" => {},
+    .@"union" => opaque {
+    },
     .@"opaque" => if (@hasDecl(T, "Signature") and @TypeOf(@field(T, "Signature")) == SerializableSignature) T else blk: {
       @compileLog("A non-serializable opaque " ++ @typeName(T) ++ " was provided to `ToSerializableT`\n");
       break :blk error.NonSerializableOpaque;
