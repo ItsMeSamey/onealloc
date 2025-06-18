@@ -116,11 +116,6 @@ fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hint: ?
       }
     }
 
-    /// This type has no dynamic data
-    pub fn readDynamicSize(_: []const u8, _: if (options.serialization == .pack) u3 else u0, _: []const u8) !usize {
-      return 0;
-    }
-
     /// This type has no dynamic size
     pub fn getDynamicSize(_: *const T) usize {
       return 0;
@@ -128,6 +123,11 @@ fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hint: ?
 
     /// Write the dynamic data for this type to the buffer and return the number of bytes written.
     pub fn writeDynamic(_: *const T, _: []u8) usize {
+      return 0;
+    }
+
+    /// This type has no dynamic data
+    pub fn readDynamicSize(_: []const u8, _: if (options.serialization == .pack) u3 else u0, _: []const u8) !usize {
       return 0;
     }
 
@@ -593,8 +593,8 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
         }
       }
 
-      pub const writeDynamic = Direct.writeDynamic;
       pub const getDynamicSize = Direct.getDynamicSize;
+      pub const writeDynamic = Direct.writeDynamic;
       pub const readDynamicSize = Direct.readDynamicSize;
 
       pub fn read(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, _: []const u8) Signature.U {
