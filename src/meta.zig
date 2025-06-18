@@ -31,8 +31,6 @@ pub const SerializableSignature = struct {
   };
 };
 
-pub const GetterSignature = struct {};
-
 /// Control how serialization of the type is done
 pub const ToSerializableOptions = struct {
   /// The type that is to be deserialized
@@ -41,14 +39,15 @@ pub const ToSerializableOptions = struct {
   serialization: SerializationOptions = .default,
   /// It is highly recommended to keep this on unless you have a REALLY good reason to turn it off
   sort_fields: bool = true,
-  /// If int is supplied, this does nothing at all. If enum supplied is non-exhaustive
+  /// If int is supplied, this does nothing at all if enum supplied is non-exhaustive
   /// and smallest int needed to represent all of its fields is smaller then one used,
   /// the enum fields will be remapped to optimize for size
   /// keys.get will still give the original value as a result
   ///
-  /// NOTE: You should ideally use, `GetShrunkEnumType` function when declaring structs themselves
-  ///   because this has a runtime cost
-  shrink_enum: bool = true,
+  /// WARNING: This internally generates a mapping from Enum's integer value to index in the enum's fields
+  ///   which adds a linear time complexity on evety enum assignment
+  ///   You should ideally use, `GetShrunkEnumType(enumtype)` instead of original enumtype for optimality
+  shrink_enum: bool = false,
   /// If set to true, serialize a Many / C / anyopaque pointer as a uint, otherwise throw a compileError
   serialize_unknown_pointer_as_usize: bool = true,
   /// Type given to the `len` argument of slices.
@@ -88,6 +87,38 @@ pub const ToSerializableOptions = struct {
   };
 };
 
+fn GetterSetter(comptime T: type, options: ToSerializableOptions, align_hint: ?std.mem.Alignment) type {
+  _ = align_hint;
+  return struct {
+    bytes: []u8,
+    offset: if (options.serialization == .pack) u3 else u0 = 0,
+
+    const NoalignSize = std.math.divCeil(comptime_int, @bitSizeOf(T), 8);
+
+    pub fn get(self: @This()) T {
+      if (@bitSizeOf(T) == 0) return undefined;
+      return switch (comptime options.serialization) {
+        .default => @bitCast(self.bytes[0..@sizeOf(T)]),
+        .noalign => {
+          var retval: T = undefined;
+          @memcpy(std.mem.asBytes(&retval), self.bytes[0..NoalignSize].ptr);
+          return retval;
+        },
+        .pack => std.mem.readPackedInt(T, self.bytes, self.offset, native_endian),
+      };
+    }
+
+    pub fn set(self: @This(), val: T) void {
+      if (@bitSizeOf(T) == 0) return;
+      switch (comptime options.serialization) {
+        .default => self.bytes[0..@sizeOf(T)].* = std.mem.toBytes(val),
+        .noalign => self.bytes[0..NoalignSize].* = std.mem.toBytes(val)[0..NoalignSize],
+        .pack => std.mem.writePackedInt(T, self.bytes, self.offset, val, native_endian),
+      }
+    }
+  };
+}
+
 /// We take in a type and just use its byte representation to store into bits.
 /// No dereferencing is done for pointers, and voids dont take up any space at all
 fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem.Alignment) type {
@@ -109,19 +140,14 @@ fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hint: ?
     /// This MUST write exactly `Signature.static_size` bits if Signature.serialization == .packed / bytes otherwise
     /// offset is always 0 unless packed is used
     pub fn writeStatic(val: *const T, bytes: []u8, offset: if (options.serialization == .pack) u3 else u0) void {
-      if (I == u0) return;
       switch (comptime options.serialization) {
         .default, .noalign => bytes[0..Signature.static_size].* = std.mem.toBytes(@as(I, @bitCast(val.*)))[0..Signature.static_size].*,
         .pack => std.mem.writePackedInt(I, bytes, offset, @as(I, @bitCast(val.*)), native_endian),
       }
     }
 
-    pub fn read(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, _: []const u8) Signature.U {
-      if (I == u0) return @bitCast(undefined);
-      return @bitCast(switch (comptime options.serialization) {
-        .default, .noalign => std.mem.readInt(I, static[0..Signature.static_size], native_endian),
-        .pack => std.mem.readPackedInt(I, static, offset, native_endian),
-      });
+    pub fn read(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, _: []const u8) GetterSetter(T, options, align_hint) {
+      return .{ .bytes = static, .offset = offset };
     }
   };
 }
@@ -553,7 +579,7 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
         .alignment = Direct.Signature.alignment,
       };
 
-      pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
+      pub fn writeStatic(val: *const T, bytes: []u8, offset: if (options.serialization == .pack) u3 else u0) void {
         if (min_bits == 0) return;
 
         const OGTT = ei.tag_type; // Original TagType
@@ -572,17 +598,20 @@ fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem
         }
       }
 
-      pub fn read(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, _: []const u8) Signature.U {
-        if (min_bits == 0) return @enumFromInt(0);
-        return @enumFromInt(switch (options.serialization) {
-          .default, .noalign => std.mem.readInt(TagType, static[0..Signature.static_size], native_endian),
-          .pack => std.mem.readPackedInt(TagType, static, offset, native_endian),
-        });
-      }
+      const WrappedGetterSetter = struct {
+        underlying: GetterSetter(Signature.U, options, align_hint),
 
-      /// Convert the given value to original type
-      pub fn toOriginalT(val: Signature.U) T {
-        return @enumFromInt(@typeInfo(T).@"enum".fields[@intFromEnum(val)]);
+        pub fn get(self: @This()) T {
+          return @enumFromInt(@typeInfo(T).@"enum".fields[@intFromEnum(self.underlying.get())]);
+        }
+
+        pub fn set(self: @This(), val: T) void {
+          writeStatic(&val, self.bytes, 0);
+        }
+      };
+
+      pub fn read(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, _: []const u8) WrappedGetterSetter {
+        return .{ .bytes = static, .offset = offset };
       }
     },
     .@"union" => |ui| if (ui.tag_type == null) blk: {
