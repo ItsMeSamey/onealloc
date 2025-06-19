@@ -215,75 +215,96 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
       },
     },
     .array => |ai| blk: {
+      if (ai.len == 0) break :blk GetDirectSerializableT(T, options, align_hint);
       const U = try ToSerializableT(ai.child, options, if (align_hint) |hint| .fromByteUnits(@min(@alignOf(ai.child), hint.toByteUnits())) else null);
+      const IndexSize = switch (options.serialization) {
+        .default => @sizeOf(options.dynamic_len_type),
+        .noalign => std.math.divCeil(comptime_int, @bitSizeOf(options.dynamic_len_type), 8),
+        .pack => @bitSizeOf(options.dynamic_len_type),
+      };
+      const StaticSize = switch (options.serialization) {
+        .default => @sizeOf(T),
+        .noalign => std.math.divCeil(comptime_int, @bitSizeOf(ai.child), 8) * ai.len,
+        .pack => @bitSizeOf(ai.child) * ai.len,
+      };
+
+      const Sint = GetDirectSerializableT(options.dynamic_len_type, options, null);
 
       break :blk opaque {
-      const I = std.meta.Int(.unsigned, Signature.static_size);
-      const IsStatic = U.IsStatic;
-      pub const Signature = SerializableSignature{
-        .T = T,
-        .U = U,
-        .static_size = switch (options.serialization) {
-          .default => @sizeOf(T),
-          .noalign => std.math.divCeil(comptime_int, @bitSizeOf(ai.child), 8) * ai.len,
-          .pack => @bitSizeOf(ai.child) * ai.len,
-        },
-        .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
-      };
+        const I = std.meta.Int(.unsigned, Signature.static_size);
+        const IsStatic = FnReturnType(U.read) == void;
+        pub const Signature = SerializableSignature{
+          .T = T,
+          .U = U,
+          .static_size = StaticSize + (ai.len - 1) * if (!IsStatic) IndexSize else 0,
+          .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
+        };
 
-      pub fn writeStatic(val: *const T, _bytes: [] u8, _offset: if (options.serialization == .pack) u3 else u0) void {
-        var bytes = _bytes;
-        var offset = _offset;
-        inline for (0..ai.len) |i| {
-          U.writeStatic(&val[i], bytes, offset);
-          switch (comptime options.serialization) {
-            .default, .noalign => bytes = bytes[U.Signature.static_size..],
-            .pack => {
-              const new_offset = U.Signature.static_size + offset;
-              bytes = bytes[new_offset >> 3..];
-              offset = new_offset & 0b111;
+        pub fn write(val: *const T, static: [] u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(U.write) {
+          var dwritten: if (IsStatic) void else options.dynamic_len_type = 0;
+          inline for (1..ai.len) |i| {
+            const swritten_idx = if (IsStatic or i == 0) 0 else IndexSize * (i - 1);
+            const swritten = swritten_idx + U.Signature.static_size * i;
+            const len = U.write(&val[i], static[switch (options.serialization) {
+              .default, .noalign => static[swritten..],
+              .pack => static[swritten >> 3..],
+            }..], switch (options.serialization) {
+              .default, .noalign => 0,
+              .pack => (swritten + offset) & 0b111,
+            }, dynamic[dwritten..]);
+            if (IsStatic) continue;
+            if (i != 0) {
+              U.write(&dwritten, static[switch (options.serialization) {
+                .default, .noalign => static[swritten_idx..],
+                .pack => static[swritten_idx >> 3..],
+              }..], switch (options.serialization) {
+                .default, .noalign => 0,
+                .pack => (swritten_idx + offset) & 0b111,
+              }, undefined);
             }
+            dwritten += len;
           }
         }
-      }
 
-      pub fn _getDynamicSize(val: *const T) usize {
-        var retval: usize = 0;
-        inline for (0..ai.len) |i| retval += U.getDynamicSize(&val[i]);
-        return retval;
-      }
-
-      pub fn _writeDynamic(val: *const T, bytes: []u8) usize {
-        var written: usize = 0;
-        inline for (0..ai.len) |i| written += U.writeDynamic(&val[i], bytes[written..]);
-        return written;
-      }
-
-      pub fn _readDynamicOffset(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) usize {
-        @compileError("TODO: Implement");
-      }
-
-      const getDynamicSize = if (IsStatic) void else _getDynamicSize;
-      const writeDynamic = if (IsStatic) void else _writeDynamic;
-      const readDynamicOffset = if (IsStatic) void else _readDynamicOffset;
-
-      pub const Array = struct {
-        static: []u8,
-        dynamic: []u8,
-        offset: if (options.serialization == .pack) u3 else u0 = 0,
-
-        pub fn get(self: @This(), i: options.dynamic_len_type) U {
-          @compileError("TODO: Implement");
-          // return switch (options.serialization) {
-          //   .default, .noalign => U.read(self.static[i * Signature.static_size..], self.offset, self.da),
-          //   .pack => U.read(self.static[i * (Signature.static_size >> 3) + ((i * (Signature.static_size & 7)) >> 3)..], (i * (Signature.static_size & 7)) & 7, self.da),
-          // };
+        const getDynamicSize = if (IsStatic) void else _getDynamicSize;
+        pub fn _getDynamicSize(val: *const T) usize {
+          var retval: usize = 0;
+          inline for (0..ai.len) |i| retval += U.getDynamicSize(&val[i]);
+          return retval;
         }
-      };
 
-      pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) Array {
-        return .{ .static = static, .dynamic = dynamic, .offset = offset };
-      }
+        pub const GS = struct {
+          static: []u8,
+          dynamic: []u8,
+          offset: if (options.serialization == .pack) u3 else u0 = 0,
+
+          pub fn get(self: @This(), i: options.dynamic_len_type) U {
+            const sindex_offset = if (IsStatic or i == 0) 0 else IndexSize * (i - 1);
+            const soffset = sindex_offset + U.Signature.static_size * i;
+            const doffset = if (IsStatic) {} else if (i == 0) 0 else Sint.read(self.static[switch (options.serialization) {
+              .default, .noalign => sindex_offset,
+              .pack => (sindex_offset + self.offset) >> 3,
+            }..], switch (options.serialization) {
+              .default, .noalign => 0,
+              .pack => (sindex_offset + self.offset) & 0b111,
+            }, undefined);
+            return U.read(self.static[switch (options.serialization) {
+              .default, .noalign => soffset,
+              .pack => (soffset + self.offset) >> 3,
+            }..], switch (options.serialization) {
+              .default, .noalign => 0,
+              .pack => (soffset + self.offset) & 0b111,
+            }, if (IsStatic) undefined else self.dynamic[doffset..]);
+          }
+
+          pub fn set(self: @This(), val: T) void {
+            write(&val, self.static, self.offset, self.dynamic);
+          }
+        };
+
+        pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) GS {
+          return .{ .static = static, .dynamic = dynamic, .offset = offset };
+        }
       };
     },
     .@"struct" => |si| if (options.recurse == 0) if (options.error_on_0_recurse) blk: {
@@ -325,21 +346,20 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           std.sort.block(std.builtin.Type.StructField, &fields_array, void, sortfn);
 
           var is_first = true;
-          const alignment = switch (options.serialization) {
-            .default => @alignOf(options.dynamic_len_type),
-            .noalign => 1,
-            .pack => 0,
-          };
 
           // Add offset int field for all but the first field, first field has u0 instead
           for (si.fields) |f| {
             if (std.meta.hasFn(f.type, "getDynamicSize")) {
               fields_slice = fields_slice ++ [1]std.builtin.Type.StructField{std.builtin.Type.StructField{
                 .name = "\xffoff" ++ f.name,
-                .type = GetDirectSerializableT(if (is_first) u0 else options.dynamic_len_type, next_options, if (is_first) 0 else alignment),
+                .type = GetDirectSerializableT(if (is_first) u0 else options.dynamic_len_type, next_options, null),
                 .default_value_ptr = null,
                 .is_comptime = false,
-                .alignment = if (is_first) 0 else alignment,
+                .alignment = if (is_first) 0 else switch (options.serialization) {
+                  .default => @alignOf(options.dynamic_len_type),
+                  .noalign => 1,
+                  .pack => 0,
+                },
               }};
               is_first = false;
             }
@@ -371,7 +391,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
 
         /// Returns the number of dynamic bytes written
         pub fn write(val: *const T, static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) if (IsStatic) void else options.dynamic_len_type {
-          var swritten: usize = 0;
+          comptime var swritten: usize = 0;
           var dwritten: if (IsStatic) void else options.dynamic_len_type = if (IsStatic) {} else 0;
           inline for (UInfo.fields) |f| {
             if (std.mem.startsWith(u8, f.name, "\xffoff") and @hasDecl(T, f.name[4..]) and std.meta.hasFn(@FieldType(Signature.U, f.name[4..]), "getDynamicSize")) continue;
@@ -383,7 +403,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
               .pack => (swritten + offset) & 0b111,
             }, dynamic);
             swritten += f.type.Signature.static_size;
-            if (@TypeOf(len) == void) continue; // Only static fields return void
+            if (comptime @TypeOf(len) == void) continue; // Only static fields return void
 
             const result = @FieldType(T, "\xffoff" ++ f.name).write(if (dwritten == 0) &@as(u0, 0) else &dwritten, static[switch (options.serialization) {
               .default, .noalign => swritten,
@@ -669,7 +689,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
                 }
               }
               const len = f.type.write(&@field(val, f.name), bytes[0..SubMax], offset, dynamic);
-              return if (@TypeOf(len) == void) 0 else len;
+              return if (IsStatic) len else if (@TypeOf(len) == void) 0 else len;
             }
           }
           unreachable;
