@@ -42,10 +42,9 @@ pub fn GetShrunkEnumType(T: type, serialization: root.ToSerializableOptions.Seri
 pub fn WrapSuper(T: type, options: root.ToSerializableOptions) type {
   std.debug.assert(@typeInfo(T) == .@"opaque");
   return struct {
-    _allocation: []align(T.Signature.alignment) T,
+    _allocation: []align(T.Signature.alignment.toByteUnits()) T,
 
     pub const Underlying = T;
-    pub const Sub = WrapSub(T, options);
     const StaticSize = switch (options.serialization) {
       .default, .noalign => T.Signature.static_size,
       .pack => std.math.divCeil(comptime_int, T.Signature.static_size, 8),
@@ -63,6 +62,7 @@ pub fn WrapSuper(T: type, options: root.ToSerializableOptions) type {
 
     pub fn deinit(self: *const @This(), allocator: std.mem.Allocator) void {
       allocator.free(self._allocation);
+      self._allocation = undefined;
     }
 
     pub fn sub(self: @This()) WrapSub(T, options) {
@@ -79,7 +79,6 @@ pub fn WrapSub(T: type, options: root.ToSerializableOptions) type {
     _offset: if (options.serialization == .pack) u3 else u0 = 0,
 
     pub const Underlying = T;
-    pub const Super = WrapSuper(T, options);
     const StaticSize = switch (options.serialization) {
       .default, .noalign => T.Signature.static_size,
       .pack => std.math.divCeil(comptime_int, T.Signature.static_size, 8),
@@ -107,7 +106,12 @@ pub fn WrapSub(T: type, options: root.ToSerializableOptions) type {
     /// This function has a comptime []const u8 as second argument if the underlying type is a struct
     pub const get = if (GetParam1 == void) _get else if (GetParam1 == []const u8) _get_comptime else _get_runtime;
 
-    const GetReturnWrapped = WrapSub(GetReturnType, options);
+    const GetReturnWrapped = switch (@typeInfo(GetReturnType)) {
+      .error_union => |ei| ei.error_set!WrapSub(ei.payload, options),
+      .optional => |oi| ?WrapSub(oi.child, options),
+      .@"opaque" => WrapSub(GetReturnType, options),
+      else => GetReturnType,
+    };
     fn _sub_comptime(self: @This(), comptime arg: GetParam1) GetReturnWrapped {
       return get(self, arg).sub();
     }
@@ -134,12 +138,19 @@ pub fn WrapSub(T: type, options: root.ToSerializableOptions) type {
 
     pub fn goIndex(self: @This(), args: anytype, comptime index: comptime_int) GoIndexReturnType(@TypeOf(args), index) {
       const field_val = @field(args, std.fmt.comptimePrint("{d}", .{index}));
-      const sub_val = if (@TypeOf(field_val) == void) self.sub() else self.sub(field_val);
-      if (@typeInfo(@TypeOf(args)).@"struct".fields.len == index + 1) return sub_val;
+      const is_void = @TypeOf(field_val) == void;
+      if (@typeInfo(@TypeOf(args)).@"struct".fields.len == index + 1) return if (is_void) self.get() else self.get(field_val);
+      const sub_val = if (is_void) self.sub() else self.sub(field_val);
+      return switch (@typeInfo(@TypeOf(sub_val))) {
+        .error_union => try sub_val,
+        .optional => sub_val.?,
+        .@"opaque" => sub_val,
+        else => unreachable,
+      }.goIndex(args, index + 1);
     }
 
     fn GoIndexReturnType(comptime Args: type, comptime index: comptime_int) type {
-      if (@typeInfo(Args).@"struct".fields.len == index + 1) return WrapSub(T, options);
+      if (@typeInfo(Args).@"struct".fields.len == index + 1) return FnReturnType(get);
       return GoIndexReturnType(Args, index + 1);
     }
   };

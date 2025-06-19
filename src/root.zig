@@ -59,8 +59,9 @@ pub const ToSerializableOptions = struct {
 /// Convert any type to a serializable type, any unsupported types present in the struct will result in a compile error.
 /// Be careful with options when using recursive structs, You will likely need to turn off (or atleast limit) options.dereference
 pub fn ToSerializable(options: ToSerializableOptions) type {
-  return serializer.ToSerializableT(options.T, options, null) catch |e|
+  const serializable = serializer.ToSerializableT(options.T, options, null) catch |e|
     @compileError(std.fmt.comptimePrint("Error: {!} while serializing {s}", .{e, @typeName(options.T)}));
+  return meta.WrapSuper(serializable, options);
 }
 
 test {
