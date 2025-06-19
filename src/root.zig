@@ -63,3 +63,7 @@ pub fn ToSerializable(options: ToSerializableOptions) type {
     @compileError(std.fmt.comptimePrint("Error: {!} while serializing {s}", .{e, @typeName(options.T)}));
 }
 
+test {
+  std.testing.refAllDeclsRecursive(@This());
+}
+

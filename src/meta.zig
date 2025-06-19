@@ -39,3 +39,7 @@ pub fn GetShrunkEnumType(T: type, serialization: root.ToSerializableOptions.Seri
   });
 }
 
+test {
+  std.testing.refAllDeclsRecursive(@This());
+}
+ 

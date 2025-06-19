@@ -769,3 +769,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
   };
 }
 
+test {
+  std.testing.refAllDeclsRecursive(@This());
+}
+
