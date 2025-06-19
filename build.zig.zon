@@ -1,0 +1,13 @@
+.{
+  .name = .onealloc,
+  .version = "0.1.0",
+  .fingerprint = 0x4de8a7a7f4865766,
+  .paths = .{
+    "build.zig",
+    "build.zig.zon",
+    "src",
+    "LICENSE",
+    "README.md",
+  },
+}
+
