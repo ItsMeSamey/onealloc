@@ -461,7 +461,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
       };
     },
     .optional => |oi| blk: {
-      const U = try ToSerializableT(union(enum) { None: void, Some: oi.child }, options, align_hint);
+      const U = try ToSerializableT(union(enum) { none: void, some: oi.child }, options, align_hint);
       const Underlying = @FieldType(U.Signature.U, "some");
       break :blk opaque {
         pub const Signature = SerializableSignature{
@@ -471,22 +471,15 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           .alignment = U.Signature.alignment,
         };
 
-        pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
+        pub fn write(val: *const T, bytes: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(U.write) {
           const u = @unionInit(Signature.U.Signature.T, if (val.*) "some" else "none", if (val.*) |v| v else {});
-          U.writeStatic(&u, bytes, offset);
-        }
-
-        pub fn _getDynamicSize(val: *const T) usize {
-          return if (val.*) |v| Underlying.getDynamicSize(&v) else 0;
-        }
-
-        pub fn _writeDynamic(val: *const T, bytes: []u8) usize {
-          return if (val.*) |v| Underlying.writeDynamic(&v, bytes) else 0;
+          U.write(&u, bytes, offset, dynamic);
         }
 
         pub const getDynamicSize = if (U.IsStatic) void else _getDynamicSize;
-        pub const writeDynamic = if (U.IsStatic) void else _writeDynamic;
-        pub const readDynamicOffset = U.readDynamicOffset;
+        pub fn _getDynamicSize(val: *const T) usize {
+          return if (val.*) |v| Underlying.getDynamicSize(&v) else 0;
+        }
 
         pub const GS = struct {
           underlying: U.GS,
@@ -498,8 +491,8 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             };
           }
 
-          pub fn set(self: @This(), val: ?Underlying) void {
-            writeStatic(&val, self.underlying.bytes, self.underlying.offset);
+          pub fn set(self: @This(), val: T) void {
+            write(&val, self.underlying.bytes, self.underlying.offset, self.underlying.dynamic);
           }
         };
 
@@ -509,7 +502,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
       };
     },
     .error_union => |ei| blk: {
-      const U = try ToSerializableT(union(enum) { Err: ei.error_set, Some: ei.payload }, options, align_hint);
+      const U = try ToSerializableT(union(enum) { err: ei.error_set, ok: ei.payload }, options, align_hint);
       const Underlying = @FieldType(U.Signature.U, "ok");
       break :blk opaque {
         pub const Signature = SerializableSignature{
@@ -519,22 +512,15 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           .alignment = U.Signature.alignment,
         };
 
-        pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
-          const u = @unionInit(Signature.U.Signature.T, if (std.meta.isError(val.*)) "Err" else "Ok", val.* catch |e| e);
-          U.writeStatic(&u, bytes, offset);
-        }
-
-        pub fn _getDynamicSize(val: *const T) usize {
-          return if (!std.meta.isError(val.*)) Underlying.getDynamicSize(&(val.* catch unreachable)) else 0;
-        }
-
-        pub fn _writeDynamic(val: *const T, bytes: []u8) usize {
-          return if (!std.meta.isError(val.*)) Underlying.writeDynamic(&(val.* catch unreachable), bytes) else 0;
+        pub fn write(val: *const T, bytes: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(U.write) {
+          const u = @unionInit(Signature.U.Signature.T, if (std.meta.isError(val.*)) "err" else "ok", val.* catch |e| e);
+          U.write(&u, bytes, offset, dynamic);
         }
 
         pub const getDynamicSize = if (U.IsStatic) void else _getDynamicSize;
-        pub const writeDynamic = if (U.IsStatic) void else _writeDynamic;
-        pub const readDynamicOffset = U.readDynamicOffset;
+        pub fn _getDynamicSize(val: *const T) usize {
+          return if (!std.meta.isError(val.*)) Underlying.getDynamicSize(&(val.* catch unreachable)) else 0;
+        }
 
         pub const GS = struct {
           underlying: U.GS,
@@ -542,12 +528,12 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           pub fn get(self: @This()) ei.error_set!U.Signature.U {
             return switch (self.underlying.get()) {
               .err => |e| e,
-              .some => |v| v,
+              .ok => |v| v,
             };
           }
 
-          pub fn set(self: @This(), val: ei.error_set!U.Signature.U) void {
-            writeStatic(&val, self.underlying.bytes, self.underlying.offset);
+          pub fn set(self: @This(), val: T) void {
+            write(&val, self.underlying.bytes, self.underlying.offset, self.underlying.dynamic);
           }
         };
 
