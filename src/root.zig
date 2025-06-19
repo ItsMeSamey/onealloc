@@ -14,7 +14,7 @@ pub const ToSerializableOptions = struct {
   /// keys.get will still give the original value as a result
   ///
   /// WARNING: This internally generates a mapping from Enum's integer value to index in the enum's fields
-  ///   which adds a linear time complexity on evety enum assignment
+  ///   which adds a linear time complexity on every enum assignment
   ///   You should ideally use, `GetShrunkEnumType(enumtype)` instead of original enumtype for optimality
   shrink_enum: bool = false,
   /// If set to true, serialize a Many / C / anyopaque pointer as a uint, otherwise throw a compileError
@@ -30,7 +30,7 @@ pub const ToSerializableOptions = struct {
   recurse: comptime_int = 1024,
   /// Error if recurse = 0
   error_on_0_recurse: bool = true,
-  /// Weather to dereference pointers or use them by value
+  /// Whether to dereference pointers or use them by value
   /// Max Number of times dereferencing is allowed.
   /// 0 means no dereferencing is done at all
   dereference: comptime_int = 1024,
