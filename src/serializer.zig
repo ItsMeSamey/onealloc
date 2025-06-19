@@ -119,7 +119,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             return U.write(val.*, bytes, offset, dynamic);
           }
 
-          const getDynamicSize = if (FnReturnType(U.write) == void) void else _getDynamicSize;
+          pub const getDynamicSize = if (FnReturnType(U.write) == void) void else _getDynamicSize;
           pub fn _getDynamicSize(val: *const T) usize {
             return U.getDynamicSize(val.*);
           }
@@ -178,7 +178,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
 
             var dwritten: options.dynamic_len_type = 0;
             for (val.*, 0..) |v, i| {
-              const sindex_offset = if (SubStatic and i == 0) 0 else Dint.Signature.static_size * (i - 1);
+              const sindex_offset = if (SubStatic or i == 0) 0 else Dint.Signature.static_size * (i - 1);
               const soffset = dindex_offset_size + Dint.Signature.static_size * (i - 1);
               const len = U.write(&v, static[soffset..], 0, if (SubStatic) undefined else dynamic[dwritten..]);
               if (SubStatic) continue;
@@ -208,7 +208,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
               std.debug.assert(self.len != 0);
               std.debug.assert(i < self.len);
               const dindex_offset_size = if (SubStatic) 0 else (self.len - 1) * Dint.Signature.static_size;
-              const sindex_offset = if (SubStatic and i == 0) 0 else Dint.Signature.static_size * (i - 1);
+              const sindex_offset = if (SubStatic or i == 0) 0 else Dint.Signature.static_size * (i - 1);
               const soffset = dindex_offset_size + Dint.Signature.static_size * (i - 1);
               const doffset = if (SubStatic) {} else if (i == 0) 0 else Dint.read(self.static[sindex_offset..], 0, undefined);
               return U.read(self.static[soffset..], 0, if (SubStatic) undefined else self.dynamic[doffset..]);
@@ -283,7 +283,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           }
         }
 
-        const getDynamicSize = if (IsStatic) void else _getDynamicSize;
+        pub const getDynamicSize = if (IsStatic) void else _getDynamicSize;
         pub fn _getDynamicSize(val: *const T) usize {
           var retval: usize = 0;
           inline for (0..ai.len) |i| retval += U.getDynamicSize(&val[i]);
@@ -437,13 +437,12 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           return dwritten;
         }
 
+        pub const getDynamicSize = if (IsStatic) void else _getDynamicSize;
         pub fn _getDynamicSize(val: *const T) usize {
           var retval: usize = 0;
           inline for (UInfo.fields) |f| retval += f.type.getDynamicSize(&@field(val.*, f.name));
           return retval;
         }
-
-        const getDynamicSize = if (IsStatic) void else _getDynamicSize;
 
         pub const GS = struct {
           static: []u8,
