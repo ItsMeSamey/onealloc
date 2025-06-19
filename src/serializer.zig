@@ -333,7 +333,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
 
           // Add offset int field for all but the first field, first field has u0 instead
           for (si.fields) |f| {
-            if (std.meta.hasFn(f.type, "writeDynamic")) {
+            if (std.meta.hasFn(f.type, "getDynamicSize")) {
               fields_slice = fields_slice ++ [1]std.builtin.Type.StructField{std.builtin.Type.StructField{
                 .name = "\xffoff" ++ f.name,
                 .type = GetDirectSerializableT(if (is_first) u0 else options.dynamic_len_type, next_options, if (is_first) 0 else alignment),
@@ -355,7 +355,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
 
       break :blk opaque {
         const IsStatic = blk: {
-          for (UInfo.fields) |f| if (std.meta.hasFn(f.type, "writeDynamic")) break :blk false;
+          for (UInfo.fields) |f| if (std.meta.hasFn(f.type, "getDynamicSize")) break :blk false;
           break :blk true;
         };
 
@@ -476,7 +476,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           U.write(&u, bytes, offset, dynamic);
         }
 
-        pub const getDynamicSize = if (U.IsStatic) void else _getDynamicSize;
+        pub const getDynamicSize = if (FnReturnType(U.write) == void) void else _getDynamicSize;
         pub fn _getDynamicSize(val: *const T) usize {
           return if (val.*) |v| Underlying.getDynamicSize(&v) else 0;
         }
@@ -517,7 +517,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           U.write(&u, bytes, offset, dynamic);
         }
 
-        pub const getDynamicSize = if (U.IsStatic) void else _getDynamicSize;
+        pub const getDynamicSize = if (FnReturnType(U.write) == void) void else _getDynamicSize;
         pub fn _getDynamicSize(val: *const T) usize {
           return if (!std.meta.isError(val.*)) Underlying.getDynamicSize(&(val.* catch unreachable)) else 0;
         }
@@ -630,8 +630,8 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           break :blk max;
         };
 
-        const IsStatic = blk: {
-          for (UInfo.fields) |f| if (std.meta.hasFn(f.type, "writeDynamic")) break :blk false;
+        pub const IsStatic = blk: {
+          for (UInfo.fields) |f| if (std.meta.hasFn(f.type, "getDynamicSize")) break :blk false;
           break :blk true;
         };
 
@@ -649,13 +649,12 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         const SizedInt = std.meta.Int(.unsigned, Signature.static_size);
         const TagInt = std.meta.Tag(TagType);
 
-        pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
+        pub fn write(val: *const T, bytes: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) if (IsStatic) void else options.dynamic_len_type {
           const active_tag = std.meta.activeTag(val.*);
           inline for (UInfo.fields) |f| {
             const ftag = comptime std.meta.stringToEnum(TagType, f.name);
             if (ftag == active_tag) {
-              f.type.writeStatic(&@field(val, f.name), bytes[0..SubMax], offset);
-              return switch (options.serialization) {
+              switch (options.serialization) {
                 .default => {
                   bytes[SubMax..][0..@sizeOf(TagInt)].* = std.mem.toBytes(active_tag);
                 },
@@ -668,12 +667,15 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
                   const _offset = tag_offset & 0b111;
                   std.mem.writePackedInt(TagInt, _bytes, _offset, @bitCast(f.type.Signature.static_size), native_endian);
                 }
-              };
+              }
+              const len = f.type.write(&@field(val, f.name), bytes[0..SubMax], offset, dynamic);
+              return if (@TypeOf(len) == void) 0 else len;
             }
           }
           unreachable;
         }
 
+        pub const getDynamicSize = if (IsStatic) void else _getDynamicSize;
         fn _getDynamicSize(val: *const T) usize {
           const active_tag = std.meta.activeTag(val.*);
           inline for (UInfo.fields) |f| {
@@ -682,29 +684,6 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           }
           unreachable;
         }
-
-        fn _writeDynamic(val: *const T, bytes: []u8) usize {
-          const active_tag = std.meta.activeTag(val.*);
-          inline for (UInfo.fields) |f| {
-            const ftag = comptime std.meta.stringToEnum(TagType, f.name);
-            if (ftag == active_tag) return f.type.writeDynamic(&@field(val, f.name), bytes);
-          }
-          unreachable;
-        }
-
-        fn _readDynamicOffset(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) usize {
-          const gs = GS{ .static = static, .dynamic = dynamic, .offset = offset };
-          const active_tag = gs.activeTag();
-          inline for (UInfo.fields) |f| {
-            const ftag = comptime std.meta.stringToEnum(TagType, f.name);
-            if (ftag == active_tag) return f.type.readDynamicOffset(static[0..SubMax], offset, dynamic);
-          }
-          unreachable;
-        }
-
-        pub const getDynamicSize = if (IsStatic) void else _getDynamicSize;
-        pub const writeDynamic = if (IsStatic) void else _writeDynamic;
-        pub const readDynamicOffset = if (IsStatic) void else _readDynamicOffset;
 
         pub const GS = struct {
           static: []u8,
@@ -723,7 +702,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             });
           }
 
-          pub fn get(self: @This()) T {
+          pub fn get(self: @This()) Signature.U {
             const active_tag = self.activeTag();
             inline for (UInfo.fields) |f| {
               const ftag = comptime std.meta.stringToEnum(TagType, f.name);
@@ -733,7 +712,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           }
 
           pub fn set(self: @This(), val: T) void {
-            writeStatic(&val, self.static, self.offset);
+            write(&val, self.static, self.offset, self.dynamic);
           }
         };
 
