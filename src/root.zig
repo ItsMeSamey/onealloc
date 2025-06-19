@@ -8,8 +8,6 @@ pub const ToSerializableOptions = struct {
   T: type,
   /// Control how value bytes are serialized
   serialization: SerializationOptions = .default,
-  /// It is highly recommended to keep this on unless you have a REALLY good reason to turn it off
-  sort_fields: bool = true,
   /// If int is supplied, this does nothing at all if enum supplied is non-exhaustive
   /// and smallest int needed to represent all of its fields is smaller then one used,
   /// the enum fields will be remapped to optimize for size
@@ -20,11 +18,11 @@ pub const ToSerializableOptions = struct {
   ///   You should ideally use, `GetShrunkEnumType(enumtype)` instead of original enumtype for optimality
   shrink_enum: bool = false,
   /// If set to true, serialize a Many / C / anyopaque pointer as a uint, otherwise throw a compileError
-  serialize_unknown_pointer_as_usize: bool = true,
+  serialize_unknown_pointer_as_usize: bool = false,
   /// Type given to the `len` argument of slices.
   /// NOTE: It is useless to change this unless you are using non-default serialization as well
   ///   Your choice will still be respected though
-  slice_len_type: type = usize,
+  dynamic_len_type: type = usize,
   /// Make all the sub structs `Serializable` as well with the same config if they are not already
   /// If this is 0, Sub structs / unions / error!unions / ?optional (even ?*optional_pointer) won't be analyzed,
   ///   Their serializer will write just their raw bytes and nothing else
