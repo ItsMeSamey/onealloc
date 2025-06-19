@@ -33,7 +33,6 @@ pub fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hin
   return opaque {
     const I = std.meta.Int(.unsigned, Signature.static_size);
     const NoalignSize = std.math.divCeil(comptime_int, @bitSizeOf(T), 8);
-    pub const IsSameOld = true;
     pub const Signature = SerializableSignature{
       .T = T,
       .U = T,
@@ -176,22 +175,35 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
           };
 
-          pub const IsSameOld = U.IsSameOld;
-
           pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
             return U.writeStatic(val.*, bytes, offset);
           }
 
-          pub fn getDynamicSize(val: *const T) usize {
+          pub fn _getDynamicSize(val: *const T) usize {
             return U.getDynamicSize(val.*);
           }
 
-          pub fn writeDynamic(val: *const T, bytes: []u8) usize {
+          pub fn _writeDynamic(val: *const T, bytes: []u8) usize {
             return U.writeDynamic(val.*, bytes);
           }
 
-          pub const readDynamicSize = U.readDynamicSize;
-          pub const read = U.read;
+          const getDynamicSize = if (U.IsStatic) void else U.getDynamicSize;
+          const writeDynamic = if (U.IsStatic) void else U.writeDynamic;
+          const readDynamicSize = U.readDynamicSize;
+          pub const GS = struct {
+            underlying: U.GS,
+
+            pub fn get(self: @This()) FnReturnType(U.GS.get) {
+              return self.underlying.get();
+            }
+
+            pub fn set(self: @This(), val: FnReturnType(U.GS.get)) void {
+              self.underlying.set(val);
+            }
+          };
+          pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) GS {
+            return .{ .underlying = U.read(static, offset, dynamic) };
+          }
         };
       },
       .slice => if (options.deslice == 0) if (options.error_on_0_deslice) blk: {
@@ -214,8 +226,6 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             },
             .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
           };
-
-          pub const IsSameOld = U.IsSameOld;
 
           pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
             switch (options.serialization) {
@@ -245,11 +255,9 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           }
 
           pub const Slice = struct {
-            static: []const u8,
-            dynamic: []const u8,
+            static: []u8,
+            dynamic: []u8,
             offset: if (options.serialization == .pack) u3 else u0 = 0,
-
-            pub const Getter = GetterSignature{};
 
             pub fn get(self: @This(), i: options.slice_len_type) U {
               @compileError("TODO: Implement");
@@ -260,7 +268,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             }
           };
 
-          pub fn read(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) Slice {
+          pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) Slice {
             return .{ .static = static, .dynamic = dynamic, .offset = offset, };
           }
         };
@@ -270,8 +278,8 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
       const U = try ToSerializableT(ai.child, options, if (align_hint) |hint| .fromByteUnits(@min(@alignOf(ai.child), hint.toByteUnits())) else null);
 
       break :blk opaque {
-      pub const IsSameOld = if (@hasDecl(U, "IsSameOld") and !U.IsSameOld) false else true;
-
+      const I = std.meta.Int(.unsigned, Signature.static_size);
+      const IsStatic = U.IsStatic;
       pub const Signature = SerializableSignature{
         .T = T,
         .U = U,
@@ -283,7 +291,6 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
       };
 
-      const I = std.meta.Int(.unsigned, Signature.static_size);
       pub fn writeStatic(val: *const T, _bytes: [] u8, _offset: if (options.serialization == .pack) u3 else u0) void {
         var bytes = _bytes;
         var offset = _offset;
@@ -300,28 +307,30 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         }
       }
 
-      pub fn getDynamicSize(val: *const T) usize {
+      pub fn _getDynamicSize(val: *const T) usize {
         var retval: usize = 0;
         inline for (0..ai.len) |i| retval += U.getDynamicSize(&val[i]);
         return retval;
       }
 
-      pub fn writeDynamic(val: *const T, bytes: []u8) usize {
+      pub fn _writeDynamic(val: *const T, bytes: []u8) usize {
         var written: usize = 0;
         inline for (0..ai.len) |i| written += U.writeDynamic(&val[i], bytes[written..]);
         return written;
       }
 
-      pub fn readDynamicSize(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) usize {
+      pub fn _readDynamicSize(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) usize {
         @compileError("TODO: Implement");
       }
 
-      pub const Array = struct {
-        static: []const u8,
-        dynamic: []const u8,
-        offset: if (options.serialization == .pack) u3 else u0 = 0,
+      const getDynamicSize = if (IsStatic) void else _getDynamicSize;
+      const writeDynamic = if (IsStatic) void else _writeDynamic;
+      const readDynamicSize = if (IsStatic) void else _readDynamicSize;
 
-        pub const Getter = GetterSignature{};
+      pub const Array = struct {
+        static: []u8,
+        dynamic: []u8,
+        offset: if (options.serialization == .pack) u3 else u0 = 0,
 
         pub fn get(self: @This(), i: options.slice_len_type) U {
           @compileError("TODO: Implement");
@@ -332,7 +341,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         }
       };
 
-      pub fn read(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) Array {
+      pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) Array {
         return .{ .static = static, .dynamic = dynamic, .offset = offset };
       }
       };
@@ -352,10 +361,8 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
       };
 
       break :blk opaque {
-        pub const IsSameOld = options.serialization == .default and blk: {
-          for (UInfo.fields, si.fields) |f, s| {
-            if (f.name != s.name or @hasDecl(f.type, "IsSameOld") and !f.type.IsSameOld) break :blk false;
-          }
+        const IsStatic = blk: {
+          for (UInfo.fields) |f| if (std.meta.hasFn(f.type, "writeDynamic")) break :blk false;
           break :blk true;
         };
 
@@ -385,47 +392,80 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           }
         }
 
-        pub fn getDynamicSize(val: *const T) usize {
+        pub fn _getDynamicSize(val: *const T) usize {
           var retval: usize = 0;
           inline for (UInfo.fields) |f| retval += f.type.getDynamicSize(&@field(val.*, f.name));
           return retval;
         }
 
-        pub fn writeDynamic(val: *const T, bytes: []u8) usize {
+        pub fn _writeDynamic(val: *const T, bytes: []u8) usize {
           var written: usize = 0;
           for (UInfo.fields) |f| written = f.type.writeDynamic(&@field(val.*, f.name), bytes[written..]);
           return written;
         }
 
+        pub fn _readDynamicSize(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) usize {
+          var retval: usize = 0;
+          comptime var soffset: usize = 0;
+          inline for (UInfo.fields) |f| {
+            retval += switch (options.serialization) {
+              .default, .noalign => f.type.readDynamicSize(static[soffset..], offset, dynamic),
+              .pack => blk: {
+                const after_sum = soffset + offset;
+                break :blk f.type.readDynamicSize(static[after_sum >> 3..], @intCast(after_sum & 0b111), dynamic);
+              },
+            };
+            soffset += f.type.Signature.static_size;
+          }
+          return retval;
+        }
+
+        const getDynamicSize = if (IsStatic) void else _getDynamicSize;
+        const writeDynamic = if (IsStatic) void else _writeDynamic;
+        const readDynamicSize = if (IsStatic) void else _readDynamicSize;
+
         pub const Struct = struct {
-          static: []const u8,
-          dynamic: []const u8,
+          static: []u8,
+          dynamic: []u8,
           offset: if (options.serialization == .pack) u3 else u0 = 0,
 
-          pub const Getter = GetterSignature{};
-
           pub fn get(self: @This(), comptime name: []const u8) FnReturnType(@FieldType(Signature.U, name).read) {
-            comptime var offset: usize = 0;
+            const IsDyn = !IsStatic and std.meta.hasFn(@FieldType(Signature.U, name), "readDynamicSize");
+            comptime var soffset: usize = 0;
+            var doffset: usize = 0;
             inline for (UInfo.fields) |f| {
-              comptime {
-                if (!std.mem.eql(u8, f.name, name)) {
-                  offset += f.type.Signature.static_size;
-                  continue;
+              if (!comptime std.mem.eql(u8, f.name, name)) {
+                if (comptime IsDyn and std.meta.hasFn(f.type, "readDynamicSize")) {
+                  doffset += switch (options.serialization) {
+                    .default, .noalign => f.type.readDynamicSize(self.static[soffset..], self.offset, self.dynamic[doffset..]),
+                    .pack => blk: {
+                      const after_sum = soffset + self.offset;
+                      break :blk f.type.readDynamicSize(self.static[after_sum >> 3..], @intCast(after_sum & 0b111), self.dynamic[doffset..]);
+                    },
+                  };
                 }
+                soffset += f.type.Signature.static_size;
+              } else {
+                return switch (options.serialization) {
+                  .default, .noalign => f.type.read(self.static[soffset..], self.offset, if (IsDyn) self.dynamic[doffset..] else undefined),
+                  .pack => blk: {
+                    const after_sum = soffset + self.offset;
+                    break :blk f.type.read(self.static[after_sum >> 3..], @intCast(after_sum & 0b111), if (IsDyn) self.dynamic[doffset..] else undefined);
+                  },
+                };
               }
-              return switch (options.serialization) {
-                .default, .noalign => f.type.read(self.static[offset..], self.offset, self.dynamic),
-                .pack => blk: {
-                  const after_sum = offset + self.offset;
-                  break :blk f.type.read(self.static[after_sum >> 3..], @intCast(after_sum & 0b111), self.dynamic);
-                },
-              };
             }
             unreachable;
           }
+
+          /// Asserts that the new value's dynamic size is <= the initial dynamic size
+          pub fn set(self: @This(), val: T) void {
+            writeStatic(&val, self.static, self.offset);
+            if (!IsStatic) _writeDynamic(&val, self.dynamic);
+          }
         };
 
-        pub fn read(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) Struct {
+        pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) Struct {
           return .{ .static = static, .dynamic = dynamic, .offset = offset, };
         }
       };
@@ -440,7 +480,6 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           .static_size = U.Signature.static_size,
           .alignment = U.Signature.alignment,
         };
-        pub const IsSameOld = U.IsSameOld;
 
         pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
           const u = @unionInit(Signature.U.Signature.T, if (val.*) "some" else "none", if (val.*) |v| v else {});
@@ -489,7 +528,6 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           .static_size = U.Signature.static_size,
           .alignment = U.Signature.alignment,
         };
-        pub const IsSameOld = U.IsSameOld;
 
         pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
           const u = @unionInit(Signature.U.Signature.T, if (std.meta.isError(val.*)) "Err" else "Ok", val.* catch |e| e);
@@ -531,7 +569,6 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
     .@"enum" => |ei| if (ei.is_exhaustive or (options.shrink_enum and @bitSizeOf(T) == std.math.log2_int_ceil(usize, ei.fields.len))) blk: {
       break :blk GetDirectSerializableT(T, options, align_hint);
     } else opaque {
-      pub const IsSameOld = false;
       const TagType = @typeInfo(Signature.U).@"enum".tag_type;
       const min_bits = @bitSizeOf(TagType);
       const Direct = GetDirectSerializableT(Signature.U, options, align_hint);
