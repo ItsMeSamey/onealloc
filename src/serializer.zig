@@ -115,21 +115,15 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
           };
 
-          pub fn writeStatic(val: *const T, bytes: []align(Signature.alignment.toByteUnits()) u8, offset: if (options.serialization == .pack) u3 else u0) void {
-            return U.writeStatic(val.*, bytes, offset);
+          pub fn write(val: *const T, bytes: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(U.write) {
+            return U.write(val.*, bytes, offset, dynamic);
           }
 
+          const getDynamicSize = if (FnReturnType(U.write) == void) void else _getDynamicSize;
           pub fn _getDynamicSize(val: *const T) usize {
             return U.getDynamicSize(val.*);
           }
 
-          pub fn _writeDynamic(val: *const T, bytes: []u8) usize {
-            return U.writeDynamic(val.*, bytes);
-          }
-
-          const getDynamicSize = if (U.IsStatic) void else U.getDynamicSize;
-          const writeDynamic = if (U.IsStatic) void else U.writeDynamic;
-          const readDynamicOffset = U.readDynamicOffset;
           pub const GS = struct {
             underlying: U.GS,
 
@@ -141,6 +135,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
               self.underlying.set(val);
             }
           };
+
           pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) GS {
             return .{ .underlying = U.read(static, offset, dynamic) };
           }
@@ -157,6 +152,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         }, null);
 
         break :blk opaque {
+          const SubStatic = FnReturnType(pi.child) == void;
           pub const Signature = SerializableSignature{
             .T = T,
             .U = U,
@@ -176,7 +172,9 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
 
           pub fn getDynamicSize(val: *const T) usize {
             var retval: usize = U.Signature.static_size * val.*.len;
-            for (val.*) |v| retval += U.getDynamicSize(&v);
+            if (!SubStatic) {
+              for (val.*) |v| retval += U.getDynamicSize(&v);
+            }
             return retval;
           }
 
@@ -190,11 +188,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             return written;
           }
 
-          pub fn readDynamicOffset(static: []const u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []const u8) usize {
-            @compileError("TODO: Implement");
-          }
-
-          pub const Slice = struct {
+          pub const GS = struct {
             static: []u8,
             dynamic: []u8,
             offset: if (options.serialization == .pack) u3 else u0 = 0,
@@ -208,7 +202,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             }
           };
 
-          pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) Slice {
+          pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) GS {
             return .{ .static = static, .dynamic = dynamic, .offset = offset, };
           }
         };
