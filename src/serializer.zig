@@ -52,7 +52,7 @@ pub fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hin
       return switch (@typeInfo(T)) {
         .@"enum" => @intFromEnum(val),
         .pointer => |pi| switch (pi.size) {
-          .one, .c, .many => @intFromFloat(val),
+          .one, .c, .many => @intFromPtr(val),
           .slice => @bitCast(val),
         },
         .error_set => @intFromError(val),
@@ -90,31 +90,27 @@ pub fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hin
 
       pub fn get(self: @This()) T {
         if (@bitSizeOf(T) == 0) return undefined;
-        return switch (comptime options.serialization) {
-          .default => {
-            var retval: T = undefined;
-            @memcpy(std.mem.asBytes(&retval), self.static[0..@sizeOf(T)]);
-            return retval;
-          },
-          .noalign => {
-            var retval: T = undefined;
-            @memcpy(std.mem.asBytes(&retval)[0..NoalignSize], self.static[0..NoalignSize]);
-            return retval;
-          },
-          .pack => fromI(std.mem.readPackedInt(I, self.static, self.offset, native_endian)),
-        };
+        var retval: T = undefined;
+        switch (comptime options.serialization) {
+          .default => @memcpy(std.mem.asBytes(&retval), self.static[0..@sizeOf(T)]),
+          .noalign => @memcpy(std.mem.asBytes(&retval)[0..NoalignSize], self.static[0..NoalignSize]),
+          .pack => retval = fromI(std.mem.readPackedInt(I, self.static, self.offset, native_endian)),
+        }
+        return retval;
       }
 
       pub fn set(self: @This(), val: T) void {
         write(&val, self.static, self.offset, undefined);
       }
 
-      pub fn wrap(_: @This()) void {
+      pub fn wrap(_: @This()) struct { const Underlying = Self; } {
         @compileError("Cannot wrap unwrapped type " ++ @typeName(T));
       }
     };
+    const Self = @This();
 
     pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, _: []u8) GS {
+      std.debug.print("CALLEDWITH: StaticSize: {d}\n", .{static.len});
       return .{ .static = static, .offset = offset };
     }
   };
@@ -710,13 +706,8 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         var new_options = options;
         new_options.recurse -= 1;
         for (0..fields_array.len) |i| {
-          switch (options.serialization) {
-            .default => {},
-            .noalign => fields_array[i].alignment = 1,
-            .pack => fields_array[i].alignment = 0,
-          }
           fields_array[i].type = try ToSerializableT(fields_array[i].type, new_options, switch (options.serialization) {
-            .default => .fromByteUnits(@max(fields_array[i].alignment, 1)),
+            .default => if(fields_array[i].alignment != 0) .fromByteUnits(fields_array[i].alignment) else null,
             else => null,
           });
         }
@@ -767,12 +758,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             const ftag = comptime std.meta.stringToEnum(TagType, f.name);
             if (ftag == active_tag) {
               switch (options.serialization) {
-                .default => {
-                  static[SubMax..][0..@sizeOf(TagInt)].* = std.mem.toBytes(active_tag);
-                },
-                .noalign => {
-                  static[SubMax..][0..divCeil(comptime_int, @bitSizeOf(TagInt), 8)].* = std.mem.toBytes(active_tag);
-                },
+                .default, .noalign => @memcpy(static[SubMax..][0..TagSize], std.mem.asBytes(&active_tag)[0..TagSize]),
                 .pack => {
                   const tag_offset = @as(usize, SubMax) + offset;
                   const _bytes = static[tag_offset >> 3..];
@@ -780,7 +766,11 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
                   std.mem.writePackedInt(TagInt, _bytes, _offset, @intFromEnum(active_tag), native_endian);
                 }
               }
-              const len = f.type.write(&@field(val, f.name), static[0..SubMax], offset, dynamic);
+              const fv = @field(val, f.name);
+              const len = switch (options.serialization) {
+                .default, .noalign => f.type.write(&fv, static[0..SubMax], offset, dynamic),
+                .pack => f.type.write(&fv, static, offset, dynamic),
+              };
               return if (IsStatic) len else if (@TypeOf(len) == void) 0 else len;
             }
           }
@@ -792,25 +782,26 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           const active_tag = std.meta.activeTag(val.*);
           inline for (UFields) |f| {
             const ftag = comptime std.meta.stringToEnum(TagType, f.name);
-            if (ftag == active_tag) return f.type.getDynamicSize(&@field(val, f.name));
+            const fv = @field(val, f.name);
+            if (ftag == active_tag) return f.type.getDynamicSize(&fv);
           }
           unreachable;
         }
 
         pub const GS = struct {
           static: []u8,
-          dynamic: []u8,
+          dynamic: if (IsStatic) void else []u8,
           offset: if (options.serialization == .pack) u3 else u0 = 0,
 
           pub fn activeTag(self: @This()) TagType {
             var retval: TagInt = undefined;
             switch (options.serialization) {
-              .default => std.mem.asBytes(&retval)[0..@sizeOf(TagInt)].* = self.static[SubMax..][0..@sizeOf(TagInt)].*,
-              .noalign => std.mem.asBytes(&retval)[0..divCeil(comptime_int, @bitSizeOf(TagInt), 8)].* =
-                self.static[SubMax..][0..divCeil(comptime_int, @bitSizeOf(TagInt), 8)].*,
-              .pack => retval = std.mem.readPackedInt(TagInt, self.static, @as(usize, SubMax) + self.offset, native_endian),
+              .default, .noalign => @memcpy(std.mem.asBytes(&retval)[0..TagSize], self.static[SubMax..][0..TagSize]),
+              .pack => {
+                const tag_offset = @as(usize, SubMax) + self.offset;
+                retval = std.mem.readPackedInt(TagInt, self.static, tag_offset, native_endian);
+              },
             }
-            // return std.meta.intToEnum(TagType, retval) catch unreachable;
             return @enumFromInt(retval);
           }
 
@@ -819,10 +810,23 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             inline for (UFields) |f| {
               const ftag = comptime std.meta.stringToEnum(TagType, f.name);
               if (ftag == active_tag) {
-                return @unionInit(Signature.U, f.name, f.type.read(self.static[0..switch (options.serialization) {
+                std.debug.print("StaticSize: {d}\n", .{switch (options.serialization) {
                   .default, .noalign => f.type.Signature.static_size,
                   .pack => f.type.Signature.static_size >> 3,
-                }], self.offset, self.dynamic));
+                }});
+                const sub_slice = switch (options.serialization) {
+                  .default, .noalign => self.static[0..f.type.Signature.static_size],
+                  .pack => self.static[0..divCeil(comptime_int, f.type.Signature.static_size, 8)],
+                };
+                std.debug.print("Static: {any}\n", .{sub_slice});
+                std.debug.print("Init with {s}\n", .{f.name});
+                const read_data = f.type.read(sub_slice, self.offset, if (IsStatic) undefined else self.dynamic);
+                std.debug.print("Read: {any}\n", .{read_data});
+                const retval = @unionInit(Signature.U, f.name, read_data);
+                std.debug.print("Returning {any}\n", .{retval});
+                const converted_back = @field(retval, f.name);
+                std.debug.print("Converted back: {any}\n", .{converted_back}); // Errors!!!
+                return retval;
               }
             }
             unreachable;
@@ -833,13 +837,14 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           }
 
           pub fn wrap(self: @This()) meta.WrapSub(Self, options) {
-            return .{ ._static = self.static, ._offset = self.offset, ._dynamic = self.dynamic };
+            return .{ ._static = self.static, ._offset = self.offset, ._dynamic = if (IsStatic) undefined else self.dynamic };
           }
         };
         const Self = @This();
 
         pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) GS {
-          return .{ .static = static, .dynamic = dynamic, .offset = offset };
+          std.debug.print("READ: StaticSize: {d}\n", .{static.len});
+          return .{ .static = static, .dynamic = if (IsStatic) {} else dynamic, .offset = offset };
         }
       };
     },
@@ -894,7 +899,15 @@ fn expectEqual(expected: anytype, actual: anytype) !void {
       const gotten = actual.get();
       try expectEqual(std.meta.activeTag(expected), std.meta.activeTag(gotten));
       inline for (std.meta.fields(@TypeOf(expected))) |f| {
-        if (std.meta.activeTag(expected) == std.meta.stringToEnum(ui.tag_type.?, f.name)) {
+        if (std.meta.activeTag(expected) == comptime std.meta.stringToEnum(ui.tag_type.?, f.name)) {
+          std.debug.print("fields: {s}.{s}\n", .{@typeName(@TypeOf(actual)), f.name});
+          const Underlying = FnReturnType(@TypeOf(@TypeOf(@field(gotten, f.name)).wrap)).Underlying;
+          if (@field(gotten, f.name).static.len > Underlying.Signature.static_size) {
+            std.debug.panic("static_len = {d}, expect = {d} vs parents static_len = {d}\n", .{@field(gotten, f.name).static.len, Underlying.Signature.static_size, actual.static.len});
+          }
+          inline for (std.meta.fields(@TypeOf(@field(gotten, f.name)))) |f2| {
+            std.debug.print("{s} = {any}\n", .{f2.name, @field(@field(gotten, f.name), f2.name)});
+          }
           return expectEqual(@field(expected, f.name), @field(gotten, f.name));
         }
       }
@@ -925,6 +938,11 @@ fn _testSerializationDeserialization(comptime options: ToSerializableOptions, va
   }
 
   const reader = SerializableT.read(&static_buffer, 0, &dynamic_buffer);
+  if (@typeInfo(options.T) != .pointer or @typeInfo(options.T).pointer.size != .slice) {
+    try std.testing.expectEqual(static_size_bytes, reader.static.len);
+  }
+
+  std.io.getStdErr().writeAll(std.fmt.comptimePrint("{any}\n", .{options})) catch unreachable;
   try expectEqual(value, reader);
 }
 
