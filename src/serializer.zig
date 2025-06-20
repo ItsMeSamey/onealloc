@@ -182,7 +182,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         const Dint = GetDirectSerializableT(options.dynamic_len_type, next_options, align_hint);
 
         break :blk opaque {
-          const SubStatic = FnReturnType(pi.child.write) == void;
+          const SubStatic = FnReturnType(@TypeOf(U.write)) == void;
           pub const Signature = SerializableSignature{
             .T = T,
             .U = U,
@@ -196,13 +196,14 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             if (val_len == 0) return 0;
 
             const dindex_offset_size = if (SubStatic) 0 else (val_len - 1) * Dint.Signature.static_size;
-            const static = _dynamic[0..val_len * U.Signature.static_size + dindex_offset_size];
-            const dynamic = _dynamic[val_len * U.Signature.static_size + dindex_offset_size..];
+            const static_len = val_len * U.Signature.static_size + dindex_offset_size;
+            const static = _dynamic[0..static_len];
+            const dynamic = _dynamic[static_len..];
 
             var dwritten: options.dynamic_len_type = 0;
             for (val.*, 0..) |v, i| {
               const sindex_offset = if (SubStatic or i == 0) 0 else Dint.Signature.static_size * (i - 1);
-              const soffset = dindex_offset_size + Dint.Signature.static_size * (i - 1);
+              const soffset = dindex_offset_size + U.Signature.static_size * i;
               const len = U.write(&v, static[soffset..], 0, if (SubStatic) undefined else dynamic[dwritten..]);
               if (SubStatic) continue;
               if (i != 0) {
@@ -210,6 +211,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
               }
               dwritten += len;
             }
+            return static_len + dwritten;
           }
 
           pub fn getDynamicSize(val: *const T) usize {
@@ -227,17 +229,18 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             dynamic: if (SubStatic) void else []u8,
             len: options.dynamic_len_type,
 
-            pub fn get(self: @This(), i: options.dynamic_len_type) U {
+            pub fn get(self: @This(), i: options.dynamic_len_type) U.GS {
               std.debug.assert(self.len != 0);
               std.debug.assert(i < self.len);
               const dindex_offset_size = if (SubStatic) 0 else (self.len - 1) * Dint.Signature.static_size;
               const sindex_offset = if (SubStatic or i == 0) 0 else Dint.Signature.static_size * (i - 1);
-              const soffset = dindex_offset_size + Dint.Signature.static_size * (i - 1);
-              const doffset = if (SubStatic) {} else if (i == 0) 0 else Dint.read(self.static[sindex_offset..], 0, undefined);
+              const soffset = dindex_offset_size + U.Signature.static_size * i;
+              const doffset = if (SubStatic) {} else if (i == 0) 0 else Dint.read(self.static[sindex_offset..], 0, undefined).get();
               return U.read(self.static[soffset..], 0, if (SubStatic) undefined else self.dynamic[doffset..]);
             }
 
             pub fn set(self: @This(), val: T) void {
+              std.debug.assert(self.len != 0);
               write(&val, self.static, self.offset, self.dynamic);
             }
 
@@ -249,10 +252,12 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
 
           pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) GS {
             const val_len = Sint.read(static, offset, undefined).get();
-            const dindex_offset_size = if (SubStatic) 0 else (val_len - 1) * Dint.Signature.static_size;
+            if (val_len == 0) return .{ .static = undefined, .dynamic = undefined, .len = 0 };
+
+            const static_size = val_len * U.Signature.static_size + if (SubStatic) 0 else (val_len - 1) * Dint.Signature.static_size;
             return .{
-              .static = dynamic[0..val_len * U.Signature.static_size + dindex_offset_size],
-              .dynamic = if (SubStatic) undefined else dynamic[val_len * U.Signature.static_size + dindex_offset_size..],
+              .static = dynamic[0..static_size],
+              .dynamic = if (SubStatic) undefined else dynamic[static_size..],
               .len = val_len,
             };
           }
@@ -325,9 +330,10 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           comptime len: options.dynamic_len_type = @intCast(ai.len),
 
           pub fn get(self: @This(), i: options.dynamic_len_type) U.GS {
+            if (ai.len == 0) @compileError("Cannot get 0 length array");
             const sindex_offset = if (IsStatic or i == 0) 0 else IndexSize * (i - 1);
             const soffset = sindex_offset + U.Signature.static_size * i;
-            const doffset: if (IsStatic) void else options.dynamic_len_type = if (IsStatic) {} else if (i == 0) 0 else Sint.read(self.static[switch (options.serialization) {
+            const doffset = if (IsStatic) {} else if (i == 0) 0 else Sint.read(self.static[switch (options.serialization) {
               .default, .noalign => sindex_offset,
               .pack => (sindex_offset + self.offset) >> 3,
             }..], switch (options.serialization) {
@@ -344,6 +350,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           }
 
           pub fn set(self: @This(), val: T) void {
+            if (ai.len == 0) @compileError("Cannot set 0 length array");
             write(&val, self.static, self.offset, self.dynamic);
           }
 
@@ -862,7 +869,10 @@ fn expectEqual(expected: anytype, actual: anytype) !void {
         if (info == .pointer and info.pointer.size == .one) return std.testing.expectEqual(expected, actual.get());
         return expectEqual(expected.*, actual);
       },
-      .slice => for (0..pi.child.len) |i| try expectEqual(expected[i], actual.get(i)),
+      .slice => {
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (0..expected.len) |i| try expectEqual(expected[i], actual.get(i));
+      },
       .c, .many => try expectEqual(expected, actual.get()),
     },
     .@"struct" => |si| inline for (si.fields) |f| try expectEqual(@field(expected, f.name), actual.get(f.name)),
@@ -941,15 +951,46 @@ test "primitives" {
   try testSerialization(@as(i5, -3));
 }
 
-test "enums" {
-  // Simple
-  const Color = enum { red, green, blue };
-  try testSerialization(Color.green);
+test "pointers" {
+  var x: u64 = 12345;
 
-  // Shrinking
-  const ShrunkEnum = enum(u32) { a = 0, b = 1000, c = 2000 };
-  try testSerialization(ShrunkEnum.b);
-  try testSerialization(ShrunkEnum.c);
+  // primitive pointer
+  try testSerialization(&x);
+
+  // no deref
+  try _testSerializationDeserialization(.{ .T = *u64, .dereference = 0, .serialize_unknown_pointer_as_usize = true }, &x);
+}
+
+test "slices" {
+  // primitive
+  try testSerialization(@as([]const u8, "hello zig"));
+
+  // struct
+  const Point = struct { x: u8, y: u8 };
+  try testSerialization(@as([]const Point, &.{ .{ .x = 1, .y = 2 }, .{ .x = 3, .y = 4 } }));
+
+  // nested
+  try testSerialization(@as([]const []const u8, &.{"hello", "world", "zig", "rocks"}));
+
+  // empty
+  try testSerialization(@as([]const u8, &.{}));
+  try testSerialization(@as([]const []const u8, &.{}));
+  try testSerialization(@as([]const []const u8, &.{"", "a", ""}));
+}
+
+test "arrays" {
+  // primitive
+  try testSerialization([4]u8{ 1, 2, 3, 4 });
+
+  // struct array
+  const Point = struct { x: u8, y: u8 };
+  try testSerialization([2]Point{ .{ .x = 1, .y = 2 }, .{ .x = 3, .y = 4 } });
+
+  // nested arrays
+  try testSerialization([2][2]u8{ .{ 1, 2 }, .{ 3, 4 } });
+
+  // empty
+  try testSerialization([_]u8{});
 }
 
 test "structs" {
@@ -970,29 +1011,14 @@ test "structs" {
   try testSerialization(Line{ .p1 = .{ .x = 1, .y = 2 }, .p2 = .{ .x = 3, .y = 4 } });
 }
 
+test "enums" {
+  // Simple
+  const Color = enum { red, green, blue };
+  try testSerialization(Color.green);
 
-test "pointers" {
-  var x: u64 = 12345;
-
-  // primitive pointer
-  try testSerialization(&x);
-
-  // no deref
-  try _testSerializationDeserialization(.{ .T = *u64, .dereference = 0, .serialize_unknown_pointer_as_usize = true }, &x);
-}
-
-test "arrays" {
-  // primitive
-  try testSerialization([4]u8{ 1, 2, 3, 4 });
-
-  // struct array
-  const Point = struct { x: u8, y: u8 };
-  try testSerialization([2]Point{ .{ .x = 1, .y = 2 }, .{ .x = 3, .y = 4 } });
-
-  // nested arrays
-  try testSerialization([2][2]u8{ .{ 1, 2 }, .{ 3, 4 } });
-
-  // empty
-  try testSerialization([_]u8{});
+  // Shrinking
+  const ShrunkEnum = enum(u32) { a = 0, b = 1000, c = 2000 };
+  try testSerialization(ShrunkEnum.b);
+  try testSerialization(ShrunkEnum.c);
 }
 
