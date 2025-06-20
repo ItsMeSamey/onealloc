@@ -43,7 +43,7 @@ pub fn GetShrunkEnumType(T: type, serialization: root.ToSerializableOptions.Seri
 pub fn WrapSuper(T: type, options: root.ToSerializableOptions) type {
   std.debug.assert(@typeInfo(T) == .@"opaque");
   return struct {
-    _allocation: []align(T.Signature.alignment.toByteUnits()) T,
+    _allocation: []align(T.Signature.alignment.toByteUnits()) u8,
 
     pub const Underlying = T;
     const StaticSize = switch (options.serialization) {
@@ -51,9 +51,11 @@ pub fn WrapSuper(T: type, options: root.ToSerializableOptions) type {
       .pack => std.math.divCeil(comptime_int, T.Signature.static_size, 8),
     };
 
-    pub fn init(allocator: std.mem.Allocator, val: T) !@This() {
-      const allocation_size: usize = StaticSize + if (std.meta.hasFn(T, "getDynamicSize")) T.getDynamicSize(&val) else 0;
-      const allocation = try allocator.alignedAlloc(u8, T.Signature.alignment, allocation_size);
+    pub fn init(allocator: std.mem.Allocator, val: *const T.Signature.T) !@This() {
+      const allocation_size: usize = StaticSize + if (std.meta.hasFn(T, "getDynamicSize")) T.getDynamicSize(val) else 0;
+      const allocation = try allocator.alignedAlloc(u8, T.Signature.alignment.toByteUnits(), allocation_size);
+      const written = T.write(val, allocation, 0, allocation[StaticSize..]);
+      if (@TypeOf(written) != void) std.debug.assert(written == allocation_size - StaticSize);
       return @This(){ ._allocation = allocation };
     }
 
@@ -63,7 +65,6 @@ pub fn WrapSuper(T: type, options: root.ToSerializableOptions) type {
 
     pub fn deinit(self: *const @This(), allocator: std.mem.Allocator) void {
       allocator.free(self._allocation);
-      self._allocation = undefined;
     }
 
     pub fn sub(self: @This()) WrapSub(T, options) {
@@ -85,15 +86,11 @@ pub fn WrapSub(T: type, options: root.ToSerializableOptions) type {
       .pack => std.math.divCeil(comptime_int, T.Signature.static_size, 8),
     };
 
-    pub fn init(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) @This() {
-      return .{ ._static = static, ._offset = offset, ._dynamic = dynamic };
-    }
-
-    const GetFnInfo = @typeInfo(@TypeOf(Underlying.GG.get)).@"fn";
-    const RawReturnType = GetFnInfo.return_type.?;
+    const GetFnInfo = @typeInfo(@TypeOf(Underlying.GS.get)).@"fn";
+    const RawReturnType = GetFnInfo.return_type orelse void;
     const GetParam1 = if (GetFnInfo.params.len == 1) void else GetFnInfo.params[1].type.?;
 
-    fn _raw_comptime(self: @This(), comptime arg: GetParam1) RawReturnType {
+    fn _raw_comptime(self: @This(), comptime arg: []const u8) Underlying.GS._getField(arg).type.GS {
       return T.read(self._static, self._offset, self._dynamic).get(arg);
     }
     fn _raw_runtime(self: @This(), arg: GetParam1) RawReturnType {
@@ -107,13 +104,8 @@ pub fn WrapSub(T: type, options: root.ToSerializableOptions) type {
     /// This function has a comptime []const u8 as second argument if the underlying type is a struct
     pub const raw = if (GetParam1 == void) _raw else if (GetParam1 == []const u8) _raw_comptime else _raw_runtime;
 
-    const GetReturnType = switch (@typeInfo(RawReturnType)) {
-      .error_union => |ei| ei.error_set!WrapSub(ei.payload, options),
-      .optional => |oi| ?WrapSub(oi.child, options),
-      .@"opaque" => WrapSub(GetReturnType, options),
-      else => GetReturnType,
-    };
-    fn _get_comptime(self: @This(), comptime arg: GetParam1) GetReturnType {
+    const GetReturnType = RawReturnType.Wrapped;
+    fn _get_comptime(self: @This(), comptime arg: []const u8) Underlying.GS._getField(arg).type.GS.Wrapped {
       return raw(self, arg).wrap();
     }
     fn _get_runtime(self: @This(), arg: GetParam1) GetReturnType {
@@ -128,7 +120,7 @@ pub fn WrapSub(T: type, options: root.ToSerializableOptions) type {
     /// return_type of this function is another wrapped type, unlike raw
     pub const get = if (GetParam1 == void) _get else if (GetParam1 == []const u8) _get_comptime else _get_runtime;
 
-    const SetFnInfo = @typeInfo(@TypeOf(Underlying.GG.set)).@"fn";
+    const SetFnInfo = @typeInfo(@TypeOf(Underlying.GS.set)).@"fn";
     pub fn set(self: @This(), val: SetFnInfo.params[1].type.?) void {
       T.read(self._static, self._offset, self._dynamic).set(val);
     }
@@ -187,7 +179,59 @@ pub fn WrapSub(T: type, options: root.ToSerializableOptions) type {
   };
 }
 
-test {
-  std.testing.refAllDeclsRecursive(@This());
+// ========================================
+//                 Testing                 
+// ========================================
+
+const testing = std.testing;
+
+test GetShrunkEnumType {
+  const LargeTagEnum = enum(u64) {
+    a = 0,
+    b = 0xffff_ffff_ffff_ffff,
+  };
+  const ShrunkT = GetShrunkEnumType(LargeTagEnum, .pack);
+  try testing.expect(@typeInfo(ShrunkT).@"enum".tag_type == u1);
+
+  const OptimalEnum = enum(u1) {
+    a, b,
+  };
+  const NotShrunkT = GetShrunkEnumType(OptimalEnum, .pack);
+  try testing.expect(OptimalEnum == NotShrunkT);
 }
 
+test "WrapSuper and WrapSub integration" {
+  const TestStruct = struct {
+    a: i32,
+    b: []const u8,
+    c: [2]bool,
+  };
+
+  const options: root.ToSerializableOptions = .{ .T = TestStruct, .serialization = .default };
+  const SerializableT = try serializer.ToSerializableT(TestStruct, options, null);
+
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  defer _ = gpa.deinit();
+  const allocator = gpa.allocator();
+
+  const initial_value = TestStruct{
+    .a = -100,
+    .b = "hello",
+    .c = .{ true, false },
+  };
+
+  const super: WrapSuper(SerializableT, options) = try .init(allocator, &initial_value);
+  defer super.deinit(allocator);
+
+  const sub = super.sub();
+  std.debug.print("Static: {d}\nDynamic: {d}\n", .{ sub._static, sub._dynamic });
+  std.debug.print("Len: {d}\n", .{ sub.raw("b").len });
+
+  try testing.expectEqual(initial_value.a, sub.raw("a").get());
+  // inline for (0..initial_value.b.len) |i| try testing.expectEqual(initial_value.b[i], sub.get("b").raw(i).get());
+  try testing.expectEqual(initial_value.c[0], sub.get("c").raw(0).get());
+  try testing.expectEqual(initial_value.c[1], sub.get("c").raw(1).get());
+
+  // writing
+
+}

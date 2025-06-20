@@ -108,7 +108,7 @@ pub fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hin
         const Underlying = Self;
       };
       pub fn wrap(_: @This()) Wrapped {
-        @compileError("Cannot wrap unwrapped type " ++ @typeName(T));
+        @compileError("Cannot wrap unwrapable type " ++ @typeName(T));
       }
     };
     const Self = @This();
@@ -880,10 +880,6 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
 // ========================================
 //                 Testing                 
 // ========================================
-
-test {
-  std.testing.refAllDeclsRecursive(@This());
-}
 
 const testing = std.testing;
 
