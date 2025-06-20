@@ -827,10 +827,14 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             inline for (UFields) |f| {
               const ftag = comptime std.meta.stringToEnum(TagType, f.name);
               if (ftag == active_tag) {
-                return @unionInit(Signature.U, f.name, f.type.read(switch (options.serialization) {
-                  .default, .noalign => self.static[0..f.type.Signature.static_size],
-                  .pack => self.static[0..divCeil(comptime_int, f.type.Signature.static_size, 8)],
-                }, self.offset, if (IsStatic) undefined else self.dynamic));
+                // We dont slice here because we would have to do a runtime calculation
+                // ```
+                // switch (options.serialization) {
+                //   .default, .noalign => self.static[0..f.type.Signature.static_size],
+                //   .pack => self.static[0..divCeil(usize, @as(usize, f.type.Signature.static_size) + self.offset, 8)], // runtime calculation
+                // }
+                // ```
+                return @unionInit(Signature.U, f.name, f.type.read(self.static, self.offset, if (IsStatic) undefined else self.dynamic));
               }
             }
             unreachable;
@@ -866,6 +870,10 @@ const testing = std.testing;
 
 fn expectEqual(expected: anytype, actual: anytype) !void {
   if (@TypeOf(expected) == @TypeOf(actual)) return try testing.expectEqual(expected, actual);
+  switch (@typeInfo(@TypeOf(actual))) {
+    .@"opaque", .@"struct" => {},
+    else => @compileError("Type '" ++ @typeName(@TypeOf(actual)) ++ "' is not a supported\n"),
+  }
   switch (@typeInfo(@TypeOf(expected))) {
     .type, .noreturn, .comptime_float, .comptime_int, .undefined, .null, .error_set, .@"fn", .frame, .@"anyframe", .vector, .enum_literal =>
       @compileError(std.fmt.comptimePrint("Unreachable: {s}", .{@typeName(@TypeOf(expected))})),
@@ -876,9 +884,14 @@ fn expectEqual(expected: anytype, actual: anytype) !void {
     },
     .pointer => |pi| switch (pi.size) {
       .one => {
-        const info = @typeInfo(FnReturnType(@TypeOf(@TypeOf(actual).get)));
-        if (info == .pointer and info.pointer.size == .one) return std.testing.expectEqual(expected, actual.get());
-        return expectEqual(expected.*, actual);
+        const _rt = @typeInfo(@TypeOf(@TypeOf(actual).get)).@"fn".return_type;
+        if (_rt) |rt| {
+          const info = @typeInfo(rt);
+          if (info == .pointer and info.pointer.size == .one) return std.testing.expectEqual(expected, actual.get());
+          return expectEqual(expected.*, actual);
+        } else { // Recursive type maybe
+          return expectEqual(expected, actual.get());
+        }
       },
       .slice => {
         try std.testing.expectEqual(expected.len, actual.len);
@@ -1239,34 +1252,34 @@ test "struct with zero-sized fields" {
   try testSerialization(value);
 }
 
-// test "recursive type serialization" {
-//   const Node = struct {
-//     payload: u32,
-//     next: ?*const @This(),
-//   };
-//
-//   const n4 = Node{ .payload = 4, .next = undefined }; // should not access the undefined pointer
-//   const n3 = Node{ .payload = 3, .next = &n4 };
-//   const n2 = Node{ .payload = 2, .next = &n3 };
-//   const n1 = Node{ .payload = 1, .next = &n2 };
-//
-//   // Should create blocks of 4
-//   try _testSerializationDeserialization(.{ .T = Node, .dereference = 3 }, n1);
-// }
+test "recursive type serialization" {
+  const Node = struct {
+    payload: u32,
+    next: ?*const @This(),
+  };
 
-// test "array of unions with dynamic fields" {
-//   const Message = union(enum) {
-//     text: []const u8,
-//     code: u32,
-//     err: void,
-//   };
-//
-//   const messages = [3]Message{
-//     .{ .text = "hello" },
-//     .{ .code = 404 },
-//     .{ .text = "world" },
-//   };
-//
-//   try testSerialization(messages);
-// }
+  const n4 = Node{ .payload = 4, .next = undefined }; // should not access the undefined pointer
+  const n3 = Node{ .payload = 3, .next = &n4 };
+  const n2 = Node{ .payload = 2, .next = &n3 };
+  const n1 = Node{ .payload = 1, .next = &n2 };
+
+  // Should create blocks of 4
+  try _testSerializationDeserialization(.{ .T = Node, .dereference = 0 }, n1);
+}
+
+test "array of unions with dynamic fields" {
+  const Message = union(enum) {
+    text: []const u8,
+    code: u32,
+    err: void,
+  };
+
+  const messages = [3]Message{
+    .{ .text = "hello" },
+    .{ .code = 404 },
+    .{ .text = "world" },
+  };
+
+  try testSerialization(messages);
+}
 
