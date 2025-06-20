@@ -587,7 +587,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         const Self = @This();
 
         pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) GS {
-          return .{ .underlying = .{ .static = static, .dynamic = dynamic, .offset = offset } };
+          return .{ .underlying = U.read(static, offset, dynamic) };
         }
       };
     },
@@ -633,7 +633,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         const Self = @This();
 
         pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) GS {
-          return .{ .underlying = .{ .static = static, .dynamic = dynamic, .offset = offset } };
+          return .{ .underlying = U.read(static, offset, dynamic) };
         }
       };
     },
@@ -688,7 +688,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
       const Self = @This();
 
       pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, _: []u8) GS {
-        return .{ .underlying = .{ .static = static, .offset = offset } };
+        return .{ .underlying = Direct.read(static, offset, undefined) };
       }
     },
     .@"union" => |ui| if (ui.tag_type == null) blk: {
@@ -916,7 +916,11 @@ fn _testSerializationDeserialization(comptime options: ToSerializableOptions, va
 
   const reader = SerializableT.read(&static_buffer, 0, &dynamic_buffer);
   if (@typeInfo(options.T) != .pointer or @typeInfo(options.T).pointer.size != .slice) {
-    try std.testing.expectEqual(static_size_bytes, reader.static.len);
+    if (@hasField(@TypeOf(reader), "static")) {
+      try std.testing.expectEqual(static_size_bytes, reader.static.len);
+    } else if (@hasField(@TypeOf(reader), "underlying") and @hasField(@TypeOf(reader.underlying), "static")) {
+      try std.testing.expectEqual(static_size_bytes, reader.underlying.static.len);
+    }
   }
 
   try expectEqual(value, reader);
@@ -1017,29 +1021,29 @@ test "enums" {
   try testSerialization(ShrunkEnum.c);
 }
 
-// test "optional" {
-//   // value
-//   var x: ?i32 = 42;
-//   try testSerialization(x);
-//   x = null;
-//   try testSerialization(x);
-//
-//   // pointer
-//   var y: i32 = 123;
-//   var opt_ptr: ?*i32 = &y;
-//   try testSerialization(opt_ptr);
-//
-//   opt_ptr = null;
-//   try testSerialization(opt_ptr);
-// }
+test "optional" {
+  // value
+  var x: ?i32 = 42;
+  try testSerialization(x);
+  x = null;
+  try testSerialization(x);
 
-// test "error_unions" {
-//   const MyError = error{Oops};
-//   var eu: MyError!u32 = 123;
-//   try testSerialization(eu);
-//   eu = MyError.Oops;
-//   try testSerialization(eu);
-// }
+  // pointer
+  var y: i32 = 123;
+  var opt_ptr: ?*i32 = &y;
+  try testSerialization(opt_ptr);
+
+  opt_ptr = null;
+  try testSerialization(opt_ptr);
+}
+
+test "error_unions" {
+  const MyError = error{Oops};
+  var eu: MyError!u32 = 123;
+  try testSerialization(eu);
+  eu = MyError.Oops;
+  try testSerialization(eu);
+}
 
 test "unions" {
   const Payload = union(enum) {
