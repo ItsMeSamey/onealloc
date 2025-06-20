@@ -91,10 +91,7 @@ pub fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hin
         return switch (comptime options.serialization) {
           .default => {
             var retval: T = undefined;
-            if (std.mem.asBytes(&retval).len != self.static.len) {
-              std.debug.panic("differing lengths: {} != {} for {s} w ss = {d}\n", .{ std.mem.asBytes(&retval).len, self.static.len, @typeName(T), Signature.static_size });
-            }
-            @memcpy(std.mem.asBytes(&retval), self.static);
+            @memcpy(std.mem.asBytes(&retval), self.static[0..@sizeOf(T)]);
             return retval;
           },
           .noalign => {
@@ -152,11 +149,11 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
           };
 
-          pub fn write(val: *const T, static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(U.write) {
+          pub fn write(val: *const T, static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(@TypeOf(U.write)) {
             return U.write(val.*, static, offset, dynamic);
           }
 
-          pub const getDynamicSize = if (FnReturnType(U.write) == void) void else _getDynamicSize;
+          pub const getDynamicSize = if (FnReturnType(@TypeOf(U.write)) == void) void else _getDynamicSize;
           pub fn _getDynamicSize(val: *const T) usize {
             return U.getDynamicSize(val.*);
           }
@@ -286,7 +283,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
         };
 
-        pub fn write(val: *const T, static: [] u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(U.write) {
+        pub fn write(val: *const T, static: [] u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(@TypeOf(U.write)) {
           var dwritten: if (IsStatic) void else options.dynamic_len_type = 0;
           inline for (0..ai.len) |i| {
             const swritten_idx = if (IsStatic or i == 0) 0 else IndexSize * (i - 1);
@@ -430,9 +427,10 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         pub const Signature = SerializableSignature{
           .T = T,
           .U = void,
-          .static_size = switch (options.serialization) {
-            .default, .noalign => @sizeOf(T),
-            .pack => @bitSizeOf(T),
+          .static_size = blk: {
+            var retval: usize = 0;
+            for (UFields) |f| retval += f.type.Signature.static_size;
+            break :blk retval;
           },
           .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
         };
@@ -554,12 +552,12 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           .alignment = U.Signature.alignment,
         };
 
-        pub fn write(val: *const T, static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(U.write) {
+        pub fn write(val: *const T, static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(@TypeOf(U.write)) {
           const u = @unionInit(Signature.U.Signature.T, if (val.*) "some" else "none", if (val.*) |v| v else {});
           U.write(&u, static, offset, dynamic);
         }
 
-        pub const getDynamicSize = if (FnReturnType(U.write) == void) void else _getDynamicSize;
+        pub const getDynamicSize = if (FnReturnType(@TypeOf(U.write)) == void) void else _getDynamicSize;
         pub fn _getDynamicSize(val: *const T) usize {
           return if (val.*) |v| Underlying.getDynamicSize(&v) else 0;
         }
@@ -600,12 +598,12 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           .alignment = U.Signature.alignment,
         };
 
-        pub fn write(val: *const T, static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(U.write) {
+        pub fn write(val: *const T, static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(@TypeOf(U.write)) {
           const u = @unionInit(Signature.U.Signature.T, if (std.meta.isError(val.*)) "err" else "ok", val.* catch |e| e);
           U.write(&u, static, offset, dynamic);
         }
 
-        pub const getDynamicSize = if (FnReturnType(U.write) == void) void else _getDynamicSize;
+        pub const getDynamicSize = if (FnReturnType(@TypeOf(U.write)) == void) void else _getDynamicSize;
         pub fn _getDynamicSize(val: *const T) usize {
           return if (!std.meta.isError(val.*)) Underlying.getDynamicSize(&(val.* catch unreachable)) else 0;
         }
@@ -851,7 +849,11 @@ fn expectEqual(expected: anytype, actual: anytype) !void {
     .void, .bool, .int, .float, .@"enum" => try expectEqual(expected, actual.get()),
     .array => |ai| inline for (0..ai.len) |i| try expectEqual(expected[i], actual.get(i)),
     .pointer => |pi| switch (pi.size) {
-      .one => try expectEqual(expected.*, actual),
+      .one => {
+        const info = @typeInfo(FnReturnType(@TypeOf(@TypeOf(actual).get)));
+        if (info == .pointer and info.pointer.size == .one) return std.testing.expectEqual(expected, actual.get());
+        return expectEqual(expected.*, actual);
+      },
       .slice => for (0..pi.child.len) |i| try expectEqual(expected[i], actual.get(i)),
       .c, .many => try expectEqual(expected, actual.get()),
     },
@@ -872,7 +874,7 @@ fn expectEqual(expected: anytype, actual: anytype) !void {
 }
 
 fn _testSerializationDeserialization(comptime options: ToSerializableOptions, value: options.T) !void {
-  const SerializableT = root.ToSerializable(options).Underlying;
+  const SerializableT = try ToSerializableT(options.T, options, null);
 
   const static_size_bytes = comptime if (options.serialization == .pack) divCeil(usize, SerializableT.Signature.static_size, 8)
     else SerializableT.Signature.static_size;
@@ -907,31 +909,55 @@ fn testSerialization(value: anytype) !void {
   }) |o| try _testSerializationDeserialization(o, value);
 }
 
-test "primitive types" {
+test "primitives" {
+  // Simple
   try testSerialization(@as(u32, 42));
   try testSerialization(@as(f64, 123.456));
   try testSerialization(@as(bool, true));
   try testSerialization(@as(void, {}));
-}
 
-test "packable primitives" {
+  // Packable
   try testSerialization(@as(u3,  5));
   try testSerialization(@as(i5, -3));
 }
 
-test "simple enum" {
+test "enums" {
+  // Simple
   const Color = enum { red, green, blue };
   try testSerialization(Color.green);
-}
 
-test "shrunk enum" {
+  // Shrinking
   const ShrunkEnum = enum(u32) { a = 0, b = 1000, c = 2000 };
   try testSerialization(ShrunkEnum.b);
   try testSerialization(ShrunkEnum.c);
 }
 
-test "simple struct" {
+test "structs" {
+  // Simple
   const Point = struct { x: i32, y: i32 };
   try testSerialization(Point{ .x = -10, .y = 20 });
+
+  // Packed
+  const BitField = packed struct {
+    a: u3,
+    b: bool,
+    c: i12,
+  };
+  try testSerialization(BitField{ .a = 5, .b = true, .c = -123 });
+
+  // Nested
+  const Line = struct { p1: Point, p2: Point };
+  try testSerialization(Line{ .p1 = .{ .x = 1, .y = 2 }, .p2 = .{ .x = 3, .y = 4 } });
+}
+
+
+test "pointers" {
+  var x: u64 = 12345;
+
+  // primitive pointer
+  try testSerialization(&x);
+
+  // no deref
+  try _testSerializationDeserialization(.{ .T = *u64, .dereference = 0, .serialize_unknown_pointer_as_usize = true }, &x);
 }
 
