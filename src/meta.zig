@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const serializer = @import("serializer.zig");
 
 /// Given a function type, get the return type
 pub fn FnReturnType(T: type) type {
@@ -89,69 +90,99 @@ pub fn WrapSub(T: type, options: root.ToSerializableOptions) type {
     }
 
     const GetFnInfo = @typeInfo(@TypeOf(Underlying.GG.get)).@"fn";
-    const GetReturnType = GetFnInfo.return_type.?;
+    const RawReturnType = GetFnInfo.return_type.?;
     const GetParam1 = if (GetFnInfo.params.len == 1) void else GetFnInfo.params[1].type.?;
 
-    fn _get_comptime(self: @This(), comptime arg: GetParam1) GetReturnType {
+    fn _raw_comptime(self: @This(), comptime arg: GetParam1) RawReturnType {
       return T.read(self._static, self._offset, self._dynamic).get(arg);
     }
-    fn _get_runtime(self: @This(), arg: GetParam1) GetReturnType {
+    fn _raw_runtime(self: @This(), arg: GetParam1) RawReturnType {
       return T.read(self._static, self._offset, self._dynamic).get(arg);
     }
-    fn _get(self: @This()) GetReturnType {
+    fn _raw(self: @This()) RawReturnType {
       return T.read(self._static, self._offset, self._dynamic).get();
     }
 
     /// This function has an integral second argument if the underlying type is an array or a slice
     /// This function has a comptime []const u8 as second argument if the underlying type is a struct
-    pub const get = if (GetParam1 == void) _get else if (GetParam1 == []const u8) _get_comptime else _get_runtime;
+    pub const raw = if (GetParam1 == void) _raw else if (GetParam1 == []const u8) _raw_comptime else _raw_runtime;
 
-    const GetReturnWrapped = switch (@typeInfo(GetReturnType)) {
+    const GetReturnType = switch (@typeInfo(RawReturnType)) {
       .error_union => |ei| ei.error_set!WrapSub(ei.payload, options),
       .optional => |oi| ?WrapSub(oi.child, options),
       .@"opaque" => WrapSub(GetReturnType, options),
       else => GetReturnType,
     };
-    fn _sub_comptime(self: @This(), comptime arg: GetParam1) GetReturnWrapped {
-      return get(self, arg).sub();
+    fn _get_comptime(self: @This(), comptime arg: GetParam1) GetReturnType {
+      return raw(self, arg).wrap();
     }
-    fn _sub_runtime(self: @This(), arg: GetParam1) GetReturnWrapped {
-      return get(self, arg).sub();
+    fn _get_runtime(self: @This(), arg: GetParam1) GetReturnType {
+      return raw(self, arg).wrap();
     }
-    fn _sub(self: @This()) GetReturnWrapped {
-      return get(self).sub();
+    fn _get(self: @This()) GetReturnType {
+      return raw(self).wrap();
     }
 
     /// This function has an integral second argument if the underlying type is an array or a slice
     /// This function has a comptime []const u8 as second argument if the underlying type is a struct
-    /// return_type of this function is another wrapped type, unlike get
-    pub const sub = if (GetParam1 == void) _sub else if (GetParam1 == []const u8) _sub_comptime else _sub_runtime;
+    /// return_type of this function is another wrapped type, unlike raw
+    pub const get = if (GetParam1 == void) _get else if (GetParam1 == []const u8) _get_comptime else _get_runtime;
 
     const SetFnInfo = @typeInfo(@TypeOf(Underlying.GG.set)).@"fn";
     pub fn set(self: @This(), val: SetFnInfo.params[1].type.?) void {
       T.read(self._static, self._offset, self._dynamic).set(val);
     }
 
-    pub fn go(self: @This(), args: anytype) GoIndexReturnType(@TypeOf(args), 0) {
+    pub fn go(self: @This(), args: anytype) GoIndexRT(@TypeOf(args), 0) {
       return self.goIndex(args, 0);
     }
 
-    pub fn goIndex(self: @This(), args: anytype, comptime index: comptime_int) GoIndexReturnType(@TypeOf(args), index) {
+    pub fn goIndex(self: @This(), args: anytype, comptime index: comptime_int) GoIndexRT(@TypeOf(args), index) {
       const field_val = @field(args, std.fmt.comptimePrint("{d}", .{index}));
       const is_void = @TypeOf(field_val) == void;
-      if (@typeInfo(@TypeOf(args)).@"struct".fields.len == index + 1) return if (is_void) self.get() else self.get(field_val);
       const sub_val = if (is_void) self.sub() else self.sub(field_val);
-      return switch (@typeInfo(@TypeOf(sub_val))) {
-        .error_union => try sub_val,
-        .optional => sub_val.?,
-        .@"opaque" => sub_val,
-        else => unreachable,
-      }.goIndex(args, index + 1);
+      if (@typeInfo(@TypeOf(args)).@"struct".fields.len == index + 1) return sub_val;
+      return unrevel(sub_val, args, index + 1);
     }
 
-    fn GoIndexReturnType(comptime Args: type, comptime index: comptime_int) type {
+    fn unrevel(self: @This(), subval: anytype, args: anytype, comptime index: comptime_int) void {
+      if (@typeInfo(@TypeOf(args)).@"struct".fields.len == index + 1) return subval;
+      const field_val = @field(args, std.fmt.comptimePrint("{d}", .{index}));
+      const is_void = @TypeOf(field_val) == void;
+      return self.unrevel(switch (@typeInfo(@TypeOf(subval))) {
+        .error_union => if (is_void) subval catch unreachable else @compileError("arg must be void for error to be tried"),
+        .optional => if (is_void) subval.? else @compileError("arg must be void for optional to be unwrapped"),
+        .@"struct" => {
+          if (@hasDecl(@TypeOf(subval), "Underlying") and
+            @hasDecl(@TypeOf(subval).Underlying, "Signature") and
+            @TypeOf(@TypeOf(subval).Underlying.Signature) == serializer.SerializableSignature
+          ) return @TypeOf(subval).goIndex(subval, field_val, index) else @field(subval, field_val); // arg must be of type []const u8 to access struct fields
+        },
+        .@"union" => @field(subval, field_val),
+        else => unreachable,
+      }, subval, args, index + 1);
+    }
+
+    fn GoIndexRT(Args: type, index: comptime_int) type {
       if (@typeInfo(Args).@"struct".fields.len == index + 1) return FnReturnType(get);
-      return GoIndexReturnType(Args, index + 1);
+      return UnrevelRT(RawReturnType, Args, index + 1);
+    }
+
+    fn UnrevelRT(V: type, Args: type, index: comptime_int) type {
+      if (@typeInfo(Args).@"struct".fields.len == index + 1) return V;
+      const field_val: std.builtin.Type.StructField = @typeInfo(Args).@"struct".fields[index];
+      return UnrevelRT(switch (@typeInfo(V)) {
+        .error_union => |ei| ei.payload,
+        .optional => |oi| oi.child,
+        .@"struct" => {
+          if (@hasDecl(V, "Underlying") and
+            @hasDecl(V.Underlying, "Signature") and
+            @TypeOf(V.Underlying.Signature) == serializer.SerializableSignature
+          ) return V.GoIndexRT(Args, index) else @FieldType(V, @as(field_val.type, @ptrCast(field_val.default_value_ptr.?)));
+        },
+        .@"union" => return @FieldType(V, @as(field_val.type, @ptrCast(field_val.default_value_ptr.?))),
+        else => unreachable, // Not enough fields
+      }, Args, index + 1);
     }
   };
 }
