@@ -34,6 +34,7 @@ fn divCeil(comptime T: type, a: T, b: T) T {
 /// We take in a type and just use its byte representation to store into bits.
 /// No dereferencing is done for pointers, and voids dont take up any space at all
 pub fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem.Alignment) type {
+  @setEvalBranchQuota(1000_000);
   return opaque {
     const I = std.meta.Int(.unsigned, Signature.static_size);
     const NoalignSize = divCeil(comptime_int, @bitSizeOf(T), 8);
@@ -103,7 +104,10 @@ pub fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hin
         write(&val, self.static, self.offset, undefined);
       }
 
-      pub fn wrap(_: @This()) struct { const Underlying = Self; } {
+      pub const Wrapped = struct {
+        const Underlying = Self;
+      };
+      pub fn wrap(_: @This()) Wrapped {
         @compileError("Cannot wrap unwrapped type " ++ @typeName(T));
       }
     };
@@ -117,6 +121,7 @@ pub fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hin
 
 /// We return an error instead of calling @compileError directly because we want to give the user a stacktrace
 pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std.mem.Alignment) anyerror!type {
+  @setEvalBranchQuota(1000_000);
   return switch (@typeInfo(T)) {
     .type, .noreturn, .comptime_int, .comptime_float, .undefined, .@"fn", .frame, .@"anyframe", .enum_literal => blk: {
       @compileLog("Type '" ++ @tagName(std.meta.activeTag(@typeInfo(T))) ++ "' is non serializable\n");
@@ -237,7 +242,8 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
               write(&val, self.static, self.offset, self.dynamic);
             }
 
-            pub fn wrap(self: @This()) meta.WrapSub(Self, options) {
+            pub const Wrapped = meta.WrapSub(Self, options);
+            pub fn wrap(self: @This()) Wrapped {
               return .{ ._static = self.static, ._offset = 0, ._dynamic = if (SubStatic) undefined else self.dynamic };
             }
           };
@@ -350,7 +356,8 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             write(&val, self.static, self.offset, self.dynamic);
           }
 
-          pub fn wrap(self: @This()) meta.WrapSub(Self, options) {
+            pub const Wrapped = meta.WrapSub(Self, options);
+            pub fn wrap(self: @This()) Wrapped {
             return .{ ._static = self.static, ._offset = self.offset, ._dynamic = self.dynamic };
           }
         };
@@ -365,9 +372,9 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
       @compileLog("Cannot deslice type " ++ @typeName(T) ++ " any further as options.recurse is 0\n");
       break :blk error.ErrorOn0Recurse;
     } else GetDirectSerializableT(T, options, align_hint) else blk: {
+      var next_options = options;
+      next_options.recurse -= 1;
       const UFields: []const std.builtin.Type.StructField = fields: {
-        var next_options = options;
-        next_options.recurse -= 1;
         var fields_slice = si.fields;
         var fields_array: [fields_slice.len]std.builtin.Type.StructField = fields_slice[0..fields_slice.len].*;
         for (0..fields_array.len) |i| {
@@ -518,6 +525,9 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           dynamic: []u8,
           offset: if (options.serialization == .pack) u3 else u0 = 0,
 
+          // For Internal use only, dont depend on this
+          pub const _getField = getField;
+
           fn readStaticField(self: @This(), comptime name: []const u8) FnReturnType(@TypeOf(getField(name).type.read)) {
             const soffset: usize = getStaticOffset(name);
             return getField(name).type.read(self.static[switch (options.serialization) {
@@ -548,7 +558,8 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             write(&val, self.static, self.offset, self.dynamic);
           }
 
-          pub fn wrap(self: @This()) meta.WrapSub(Self, options) {
+            pub const Wrapped = meta.WrapSub(Self, options);
+            pub fn wrap(self: @This()) Wrapped {
             return .{ ._static = self.static, ._offset = self.offset, ._dynamic = self.dynamic };
           }
         };
@@ -594,7 +605,8 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             write(&val, self.underlying.static, self.underlying.offset, self.underlying.dynamic);
           }
 
-          pub fn wrap(self: @This()) meta.WrapSub(Self, options) {
+            pub const Wrapped = meta.WrapSub(Self, options);
+            pub fn wrap(self: @This()) Wrapped {
             return .{ ._static = self.underlying.static, ._offset = self.underlying.offset, ._dynamic = self.underlying.dynamic };
           }
         };
@@ -640,7 +652,8 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             write(&val, self.underlying.static, self.underlying.offset, self.underlying.dynamic);
           }
 
-          pub fn wrap(self: @This()) meta.WrapSub(Self, options) {
+            pub const Wrapped = meta.WrapSub(Self, options);
+            pub fn wrap(self: @This()) Wrapped {
             return .{ ._static = self.underlying.static, ._offset = self.underlying.offset, ._dynamic = self.underlying.dynamic };
           }
         };
@@ -695,7 +708,8 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           write(&val, self.underlying.static, self.underlying.offset, undefined);
         }
 
-        pub fn wrap(self: @This()) meta.WrapSub(Self, options) {
+        pub const Wrapped = meta.WrapSub(Self, options);
+        pub fn wrap(self: @This()) Wrapped {
           return .{ ._static = self.underlying.static, ._offset = self.underlying.offset, ._dynamic = undefined };
         }
       };
@@ -844,7 +858,8 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             write(&val, self.static, self.offset, self.dynamic);
           }
 
-          pub fn wrap(self: @This()) meta.WrapSub(Self, options) {
+          pub const Wrapped = meta.WrapSub(Self, options);
+          pub fn wrap(self: @This()) Wrapped {
             return .{ ._static = self.static, ._offset = self.offset, ._dynamic = if (IsStatic) undefined else self.dynamic };
           }
         };
@@ -861,6 +876,10 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
     },
   };
 }
+
+// ========================================
+//                 Testing                 
+// ========================================
 
 test {
   std.testing.refAllDeclsRecursive(@This());
@@ -884,14 +903,8 @@ fn expectEqual(expected: anytype, actual: anytype) !void {
     },
     .pointer => |pi| switch (pi.size) {
       .one => {
-        const _rt = @typeInfo(@TypeOf(@TypeOf(actual).get)).@"fn".return_type;
-        if (_rt) |rt| {
-          const info = @typeInfo(rt);
-          if (info == .pointer and info.pointer.size == .one) return std.testing.expectEqual(expected, actual.get());
-          return expectEqual(expected.*, actual);
-        } else { // Recursive type maybe
-          return expectEqual(expected, actual.get());
-        }
+        const info = @typeInfo(@TypeOf(actual).Wrapped.Underlying.Signature.T);
+        if (info == .pointer and info.pointer.size == .one) return std.testing.expectEqual(expected, actual.get());
       },
       .slice => {
         try std.testing.expectEqual(expected.len, actual.len);
@@ -1234,22 +1247,46 @@ test "packed struct with mixed alignment fields" {
 }
 
 test "struct with zero-sized fields" {
-  const ZST_Struct = struct {
+  const ZST_1 = struct {
     a: u32,
     b: void,
     c: [0]u8,
     d: []const u8,
     e: bool,
   };
-  const value = ZST_Struct{
+  try testSerialization(ZST_1{
     .a = 123,
     .b = {},
     .c = .{},
     .d = "non-zst",
     .e = false,
+  });
+
+  const ZST_2 = struct {
+    a: u32,
+    zst1: void,
+    zst_array: [0]u64,
+    dynamic_zst_slice: []const void,
+    zst_union: union(enum) {
+      z: void,
+      d: u64,
+    },
+    e: bool,
   };
 
-  try testSerialization(value);
+  var value_2 = ZST_2{
+    .a = 123,
+    .zst1 = {},
+    .zst_array = .{},
+    .dynamic_zst_slice = &.{ {}, {}, {} },
+    .zst_union = .{ .z = {} },
+    .e = true,
+  };
+
+  try testSerialization(value_2);
+
+  value_2.zst_union = .{ .d = 999 };
+  try testSerialization(value_2);
 }
 
 test "recursive type serialization" {
@@ -1281,5 +1318,28 @@ test "array of unions with dynamic fields" {
   };
 
   try testSerialization(messages);
+}
+
+test "pointer and optional abuse" {
+  const Point = struct { x: i32, y: i32 };
+  const PointerAbuse = struct {
+    a: ?*const Point,
+    b: *const ?Point,
+    c: ?*const ?Point,
+    d: []const ?*const ?Point,
+  };
+
+  const p1: Point = .{ .x = 1, .y = 1 };
+  const p2: ?Point = .{ .x = 2, .y = 2 };
+  const p3: ?Point = null;
+
+  const value = PointerAbuse{
+    .a = &p1,
+    .b = &p2,
+    .c = &p2,
+    .d = &.{ &p2, null, &p3 },
+  };
+
+  try testSerialization(value);
 }
 
