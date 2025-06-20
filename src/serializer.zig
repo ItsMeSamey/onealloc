@@ -891,10 +891,11 @@ fn expectEqual(expected: anytype, actual: anytype) !void {
       } else try expectEqual(expected catch unreachable, gotten catch unreachable);
     },
     .@"union" => |ui| {
-      try expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
-      inline for (std.meta.fields(expected)) |f| {
+      const gotten = actual.get();
+      try expectEqual(std.meta.activeTag(expected), std.meta.activeTag(gotten));
+      inline for (std.meta.fields(@TypeOf(expected))) |f| {
         if (std.meta.activeTag(expected) == std.meta.stringToEnum(ui.tag_type.?, f.name)) {
-          return expectEqual(@field(expected, f.name), @field(actual, f.name));
+          return expectEqual(@field(expected, f.name), @field(gotten, f.name));
         }
       }
       unreachable;
@@ -1020,5 +1021,40 @@ test "enums" {
   const ShrunkEnum = enum(u32) { a = 0, b = 1000, c = 2000 };
   try testSerialization(ShrunkEnum.b);
   try testSerialization(ShrunkEnum.c);
+}
+
+// test "optional" {
+//   // value
+//   var x: ?i32 = 42;
+//   try testSerialization(x);
+//   x = null;
+//   try testSerialization(x);
+//
+//   // pointer
+//   var y: i32 = 123;
+//   var opt_ptr: ?*i32 = &y;
+//   try testSerialization(opt_ptr);
+//
+//   opt_ptr = null;
+//   try testSerialization(opt_ptr);
+// }
+
+// test "error_unions" {
+//   const MyError = error{Oops};
+//   var eu: MyError!u32 = 123;
+//   try testSerialization(eu);
+//   eu = MyError.Oops;
+//   try testSerialization(eu);
+// }
+
+test "unions" {
+  const Payload = union(enum) {
+    a: u32,
+    b: bool,
+    c: void,
+  };
+  try testSerialization(Payload{ .a = 99 });
+  try testSerialization(Payload{ .b = false });
+  try testSerialization(Payload{ .c = {} });
 }
 
