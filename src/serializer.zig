@@ -387,7 +387,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             return switch (options.serialization) {
               .default => if (lhs.alignment <= rhs.alignment) true
                 else lhs.type.Signature.static_size <= rhs.type.Signature.static_size,
-              .noalign, .pack => if (lhs.type.Signature.static_size == 0) rhs.type.Signature.static_size != 0
+              .noalign, .pack => if (lhs.type.Signature.static_size == 0) rhs.type.Signature.static_size == 0
                 else if (@ctz(@as(usize, lhs.type.Signature.static_size)) <= @ctz(@as(usize, rhs.type.Signature.static_size))) true
                 else lhs.type.Signature.static_size <= rhs.type.Signature.static_size,
             };
@@ -1201,4 +1201,72 @@ test "complex array" {
   // This will test if the size calculation for the array is correct,
   try testSerialization(value);
 }
+
+test "packed struct with mixed alignment fields" {
+  const MixedPack = packed struct {
+    a: u2,
+    b: u8,
+    c: u32,
+    d: bool,
+  };
+
+  const value = MixedPack{
+    .a = 3,
+    .b = 't',
+    .c = 1234567,
+    .d = true,
+  };
+
+  try testSerialization(value);
+}
+
+test "struct with zero-sized fields" {
+  const ZST_Struct = struct {
+    a: u32,
+    b: void,
+    c: [0]u8,
+    d: []const u8,
+    e: bool,
+  };
+  const value = ZST_Struct{
+    .a = 123,
+    .b = {},
+    .c = .{},
+    .d = "non-zst",
+    .e = false,
+  };
+
+  try testSerialization(value);
+}
+
+// test "recursive type serialization" {
+//   const Node = struct {
+//     payload: u32,
+//     next: ?*const @This(),
+//   };
+//
+//   const n4 = Node{ .payload = 4, .next = undefined }; // should not access the undefined pointer
+//   const n3 = Node{ .payload = 3, .next = &n4 };
+//   const n2 = Node{ .payload = 2, .next = &n3 };
+//   const n1 = Node{ .payload = 1, .next = &n2 };
+//
+//   // Should create blocks of 4
+//   try _testSerializationDeserialization(.{ .T = Node, .dereference = 3 }, n1);
+// }
+
+// test "array of unions with dynamic fields" {
+//   const Message = union(enum) {
+//     text: []const u8,
+//     code: u32,
+//     err: void,
+//   };
+//
+//   const messages = [3]Message{
+//     .{ .text = "hello" },
+//     .{ .code = 404 },
+//     .{ .text = "world" },
+//   };
+//
+//   try testSerialization(messages);
+// }
 
