@@ -110,7 +110,6 @@ pub fn GetDirectSerializableT(T: type, options: ToSerializableOptions, align_hin
     const Self = @This();
 
     pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, _: []u8) GS {
-      std.debug.print("CALLEDWITH: StaticSize: {d}\n", .{static.len});
       return .{ .static = static, .offset = offset };
     }
   };
@@ -810,23 +809,10 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             inline for (UFields) |f| {
               const ftag = comptime std.meta.stringToEnum(TagType, f.name);
               if (ftag == active_tag) {
-                std.debug.print("StaticSize: {d}\n", .{switch (options.serialization) {
-                  .default, .noalign => f.type.Signature.static_size,
-                  .pack => f.type.Signature.static_size >> 3,
-                }});
-                const sub_slice = switch (options.serialization) {
+                return @unionInit(Signature.U, f.name, f.type.read(switch (options.serialization) {
                   .default, .noalign => self.static[0..f.type.Signature.static_size],
                   .pack => self.static[0..divCeil(comptime_int, f.type.Signature.static_size, 8)],
-                };
-                std.debug.print("Static: {any}\n", .{sub_slice});
-                std.debug.print("Init with {s}\n", .{f.name});
-                const read_data = f.type.read(sub_slice, self.offset, if (IsStatic) undefined else self.dynamic);
-                std.debug.print("Read: {any}\n", .{read_data});
-                const retval = @unionInit(Signature.U, f.name, read_data);
-                std.debug.print("Returning {any}\n", .{retval});
-                const converted_back = @field(retval, f.name);
-                std.debug.print("Converted back: {any}\n", .{converted_back}); // Errors!!!
-                return retval;
+                }, self.offset, if (IsStatic) undefined else self.dynamic));
               }
             }
             unreachable;
@@ -843,7 +829,6 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         const Self = @This();
 
         pub fn read(static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) GS {
-          std.debug.print("READ: StaticSize: {d}\n", .{static.len});
           return .{ .static = static, .dynamic = if (IsStatic) {} else dynamic, .offset = offset };
         }
       };
@@ -900,14 +885,6 @@ fn expectEqual(expected: anytype, actual: anytype) !void {
       try expectEqual(std.meta.activeTag(expected), std.meta.activeTag(gotten));
       inline for (std.meta.fields(@TypeOf(expected))) |f| {
         if (std.meta.activeTag(expected) == comptime std.meta.stringToEnum(ui.tag_type.?, f.name)) {
-          std.debug.print("fields: {s}.{s}\n", .{@typeName(@TypeOf(actual)), f.name});
-          const Underlying = FnReturnType(@TypeOf(@TypeOf(@field(gotten, f.name)).wrap)).Underlying;
-          if (@field(gotten, f.name).static.len > Underlying.Signature.static_size) {
-            std.debug.panic("static_len = {d}, expect = {d} vs parents static_len = {d}\n", .{@field(gotten, f.name).static.len, Underlying.Signature.static_size, actual.static.len});
-          }
-          inline for (std.meta.fields(@TypeOf(@field(gotten, f.name)))) |f2| {
-            std.debug.print("{s} = {any}\n", .{f2.name, @field(@field(gotten, f.name), f2.name)});
-          }
           return expectEqual(@field(expected, f.name), @field(gotten, f.name));
         }
       }
