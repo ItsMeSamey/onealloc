@@ -1,6 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
-const serializer = @import("serializer.zig");
+const testing = std.testing;
 
 /// Given a function type, get the return type
 pub fn FnReturnType(T: type) type {
@@ -40,150 +40,9 @@ pub fn GetShrunkEnumType(T: type, serialization: root.ToSerializableOptions.Seri
   });
 }
 
-pub fn WrapSuper(T: type, options: root.ToSerializableOptions) type {
-  std.debug.assert(@typeInfo(T) == .@"opaque");
-  return struct {
-    _allocation: []align(T.Signature.alignment.toByteUnits()) u8,
-
-    pub const Underlying = T;
-    const StaticSize = switch (options.serialization) {
-      .default, .noalign => T.Signature.static_size,
-      .pack => std.math.divCeil(comptime_int, T.Signature.static_size, 8),
-    };
-
-    pub fn init(allocator: std.mem.Allocator, val: *const T.Signature.T) !@This() {
-      const allocation_size: usize = StaticSize + if (std.meta.hasFn(T, "getDynamicSize")) T.getDynamicSize(val) else 0;
-      const allocation = try allocator.alignedAlloc(u8, T.Signature.alignment.toByteUnits(), allocation_size);
-      const written = T.write(val, allocation, 0, allocation[StaticSize..]);
-      if (@TypeOf(written) != void) std.debug.assert(written == allocation_size - StaticSize);
-      return @This(){ ._allocation = allocation };
-    }
-
-    pub fn clone(self: *const @This(), allocator: std.mem.Allocator) !@This() {
-      return .{ ._allocation = try allocator.dupe(u8, self._allocation) };
-    }
-
-    pub fn deinit(self: *const @This(), allocator: std.mem.Allocator) void {
-      allocator.free(self._allocation);
-    }
-
-    pub fn sub(self: @This()) WrapSub(T, options) {
-      return .{ ._static = self._allocation[0..StaticSize], ._offset = 0, ._dynamic = self._allocation[StaticSize..] };
-    }
-  };
-}
-
-pub fn WrapSub(T: type, options: root.ToSerializableOptions) type {
-  std.debug.assert(@typeInfo(T) == .@"opaque");
-  return struct {
-    _static: []u8,
-    _dynamic: []u8,
-    _offset: if (options.serialization == .pack) u3 else u0 = 0,
-
-    pub const Underlying = T;
-    const StaticSize = switch (options.serialization) {
-      .default, .noalign => T.Signature.static_size,
-      .pack => std.math.divCeil(comptime_int, T.Signature.static_size, 8),
-    };
-
-    const GetFnInfo = @typeInfo(@TypeOf(Underlying.GS.get)).@"fn";
-    const RawReturnType = GetFnInfo.return_type orelse void;
-    const GetParam1 = if (GetFnInfo.params.len == 1) void else GetFnInfo.params[1].type.?;
-
-    fn _raw_comptime(self: @This(), comptime arg: []const u8) Underlying.GS._getField(arg).type.GS {
-      return T.read(self._static, self._offset, self._dynamic).get(arg);
-    }
-    fn _raw_runtime(self: @This(), arg: GetParam1) RawReturnType {
-      return T.read(self._static, self._offset, self._dynamic).get(arg);
-    }
-    fn _raw(self: @This()) RawReturnType {
-      return T.read(self._static, self._offset, self._dynamic).get();
-    }
-
-    /// This function has an integral second argument if the underlying type is an array or a slice
-    /// This function has a comptime []const u8 as second argument if the underlying type is a struct
-    pub const raw = if (GetParam1 == void) _raw else if (GetParam1 == []const u8) _raw_comptime else _raw_runtime;
-
-    const GetReturnType = RawReturnType.Wrapped;
-    fn _get_comptime(self: @This(), comptime arg: []const u8) Underlying.GS._getField(arg).type.GS.Wrapped {
-      return raw(self, arg).wrap();
-    }
-    fn _get_runtime(self: @This(), arg: GetParam1) GetReturnType {
-      return raw(self, arg).wrap();
-    }
-    fn _get(self: @This()) GetReturnType {
-      return raw(self).wrap();
-    }
-
-    /// This function has an integral second argument if the underlying type is an array or a slice
-    /// This function has a comptime []const u8 as second argument if the underlying type is a struct
-    /// return_type of this function is another wrapped type, unlike raw
-    pub const get = if (GetParam1 == void) _get else if (GetParam1 == []const u8) _get_comptime else _get_runtime;
-
-    const SetFnInfo = @typeInfo(@TypeOf(Underlying.GS.set)).@"fn";
-    pub fn set(self: @This(), val: SetFnInfo.params[1].type.?) void {
-      T.read(self._static, self._offset, self._dynamic).set(val);
-    }
-
-    pub fn go(self: @This(), args: anytype) GoIndexRT(@TypeOf(args), 0) {
-      return self.goIndex(args, 0);
-    }
-
-    pub fn goIndex(self: @This(), args: anytype, comptime index: comptime_int) GoIndexRT(@TypeOf(args), index) {
-      const field_val = @field(args, std.fmt.comptimePrint("{d}", .{index}));
-      const is_void = @TypeOf(field_val) == void;
-      const sub_val = if (is_void) self.sub() else self.sub(field_val);
-      if (@typeInfo(@TypeOf(args)).@"struct".fields.len == index + 1) return sub_val;
-      return unrevel(sub_val, args, index + 1);
-    }
-
-    fn unrevel(self: @This(), subval: anytype, args: anytype, comptime index: comptime_int) void {
-      if (@typeInfo(@TypeOf(args)).@"struct".fields.len == index + 1) return subval;
-      const field_val = @field(args, std.fmt.comptimePrint("{d}", .{index}));
-      const is_void = @TypeOf(field_val) == void;
-      return self.unrevel(switch (@typeInfo(@TypeOf(subval))) {
-        .error_union => if (is_void) subval catch unreachable else @compileError("arg must be void for error to be tried"),
-        .optional => if (is_void) subval.? else @compileError("arg must be void for optional to be unwrapped"),
-        .@"struct" => {
-          if (@hasDecl(@TypeOf(subval), "Underlying") and
-            @hasDecl(@TypeOf(subval).Underlying, "Signature") and
-            @TypeOf(@TypeOf(subval).Underlying.Signature) == serializer.SerializableSignature
-          ) return @TypeOf(subval).goIndex(subval, field_val, index) else @field(subval, field_val); // arg must be of type []const u8 to access struct fields
-        },
-        .@"union" => @field(subval, field_val),
-        else => unreachable,
-      }, subval, args, index + 1);
-    }
-
-    fn GoIndexRT(Args: type, index: comptime_int) type {
-      if (@typeInfo(Args).@"struct".fields.len == index + 1) return FnReturnType(get);
-      return UnrevelRT(RawReturnType, Args, index + 1);
-    }
-
-    fn UnrevelRT(V: type, Args: type, index: comptime_int) type {
-      if (@typeInfo(Args).@"struct".fields.len == index + 1) return V;
-      const field_val: std.builtin.Type.StructField = @typeInfo(Args).@"struct".fields[index];
-      return UnrevelRT(switch (@typeInfo(V)) {
-        .error_union => |ei| ei.payload,
-        .optional => |oi| oi.child,
-        .@"struct" => {
-          if (@hasDecl(V, "Underlying") and
-            @hasDecl(V.Underlying, "Signature") and
-            @TypeOf(V.Underlying.Signature) == serializer.SerializableSignature
-          ) return V.GoIndexRT(Args, index) else @FieldType(V, @as(field_val.type, @ptrCast(field_val.default_value_ptr.?)));
-        },
-        .@"union" => return @FieldType(V, @as(field_val.type, @ptrCast(field_val.default_value_ptr.?))),
-        else => unreachable, // Not enough fields
-      }, Args, index + 1);
-    }
-  };
-}
-
 // ========================================
 //                 Testing                 
 // ========================================
-
-const testing = std.testing;
 
 test GetShrunkEnumType {
   const LargeTagEnum = enum(u64) {
@@ -200,38 +59,3 @@ test GetShrunkEnumType {
   try testing.expect(OptimalEnum == NotShrunkT);
 }
 
-test "WrapSuper and WrapSub integration" {
-  const TestStruct = struct {
-    a: i32,
-    b: []const u8,
-    c: [2]bool,
-  };
-
-  const options: root.ToSerializableOptions = .{ .T = TestStruct, .serialization = .default };
-  const SerializableT = try serializer.ToSerializableT(TestStruct, options, null);
-
-  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-  defer _ = gpa.deinit();
-  const allocator = gpa.allocator();
-
-  const initial_value = TestStruct{
-    .a = -100,
-    .b = "hello",
-    .c = .{ true, false },
-  };
-
-  const super: WrapSuper(SerializableT, options) = try .init(allocator, &initial_value);
-  defer super.deinit(allocator);
-
-  const sub = super.sub();
-  std.debug.print("Static: {d}\nDynamic: {d}\n", .{ sub._static, sub._dynamic });
-  std.debug.print("Len: {d}\n", .{ sub.raw("b").len });
-
-  try testing.expectEqual(initial_value.a, sub.raw("a").get());
-  // inline for (0..initial_value.b.len) |i| try testing.expectEqual(initial_value.b[i], sub.get("b").raw(i).get());
-  try testing.expectEqual(initial_value.c[0], sub.get("c").raw(0).get());
-  try testing.expectEqual(initial_value.c[1], sub.get("c").raw(1).get());
-
-  // writing
-
-}

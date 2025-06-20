@@ -3,9 +3,71 @@ const builtin = @import("builtin");
 const root = @import("root.zig");
 const meta = @import("meta.zig");
 
+const testing = std.testing;
 const FnReturnType = meta.FnReturnType;
-const ToSerializableOptions = root.ToSerializableOptions;
 const native_endian = builtin.cpu.arch.endian();
+
+/// Control how serialization of the type is done
+pub const ToSerializableOptions = struct {
+  /// The type that is to be deserialized
+  T: type,
+  /// Control how value bytes are serialized
+  serialization: SerializationOptions = .default,
+  /// If int is supplied, this does nothing at all if enum supplied is non-exhaustive
+  /// and smallest int needed to represent all of its fields is smaller then one used,
+  /// the enum fields will be remapped to optimize for size
+  /// keys.get will still give the original value as a result
+  ///
+  /// WARNING: This internally generates a mapping from Enum's integer value to index in the enum's fields
+  ///   which adds a linear time complexity on every enum assignment
+  ///   You should ideally use, `GetShrunkEnumType(enumtype)` instead of original enumtype for optimality
+  shrink_enum: bool = false,
+  /// If set to true, serialize a Many / C / anyopaque pointer as a uint, otherwise throw a compileError
+  serialize_unknown_pointer_as_usize: bool = false,
+  /// Type given to the `len` argument of slices.
+  /// NOTE: It is useless to change this unless you are using non-default serialization as well
+  ///   Your choice will still be respected though
+  dynamic_len_type: type = usize,
+  /// Make all the sub structs `Serializable` as well with the same config if they are not already
+  /// If this is 0, Sub structs / unions / error!unions / ?optional (even ?*optional_pointer) won't be analyzed,
+  ///   Their serializer will write just their raw bytes and nothing else
+  /// A reasonably large number is chosen as a default
+  recurse: comptime_int = 1024,
+  /// Error if recurse = 0
+  error_on_0_recurse: bool = true,
+  /// Whether to dereference pointers or use them by value
+  /// Max Number of times dereferencing is allowed.
+  /// 0 means no dereferencing is done at all
+  dereference: comptime_int = 1024,
+  /// Error if dereference = 0
+  error_on_0_dereference: bool = true,
+  /// What is the maximum number of expansion of slices that can be done
+  /// for example in a recursive structure or nested slices
+  ///
+  /// eg.
+  /// If we have [][]u8, and deslice = 1, we will write pointer+size of all the strings in this slice
+  /// If we have [][]u8, and deslice = 2, we will write all the characters in this block
+  deslice: comptime_int = 1024,
+  /// Error if deslice = 0
+  error_on_0_deslice: bool = true,
+
+  pub const SerializationOptions = enum {
+    ///stuffs together like in packed struct, 2 u22's take up 44 bits
+    pack,
+    /// remove alignment when packing, 2 u22's take up 2 * 24 = 48 bits
+    noalign,
+    /// do not remove padding, 2 u22's will take up 2 * 32 = 64 bits
+    default,
+  };
+};
+
+/// Convert any type to a serializable type, any unsupported types present in the struct will result in a compile error.
+/// Be careful with options when using recursive structs, You will likely need to turn off (or atleast limit) options.dereference
+pub fn ToSerializable(options: ToSerializableOptions) type {
+  const serializable = ToSerializableT(options.T, options, null) catch |e|
+    @compileError(std.fmt.comptimePrint("Error: {!} while serializing {s}", .{e, @typeName(options.T)}));
+  return meta.WrapSuper(serializable, options);
+}
 
 /// This is used to recognize if types were rFneturned by ToSerializable.
 /// This is done by assigning `pub const Signature = SerializableSignature;` inside an opaque
@@ -18,13 +80,6 @@ pub const SerializableSignature = struct {
   static_size: comptime_int,
   /// Always .@"1" unless .default is used
   alignment: std.mem.Alignment,
-
-  pub const IntegerTypeType = struct {
-    /// Bitlen of the int type
-    len: comptime_int,
-    /// Static multiplier (in bits if pack, in bytes if default/noalign)
-    multiplier: comptime_int,
-  };
 };
 
 fn divCeil(comptime T: type, a: T, b: T) T {
@@ -881,8 +936,6 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
 //                 Testing                 
 // ========================================
 
-const testing = std.testing;
-
 fn expectEqual(expected: anytype, actual: anytype) !void {
   if (@TypeOf(expected) == @TypeOf(actual)) return try testing.expectEqual(expected, actual);
   switch (@typeInfo(@TypeOf(actual))) {
@@ -1337,5 +1390,205 @@ test "pointer and optional abuse" {
   };
 
   try testSerialization(value);
+}
+
+// ========================================
+//                   Meta                  
+// ========================================
+
+pub fn WrapSuper(T: type, options: ToSerializableOptions) type {
+  std.debug.assert(@typeInfo(T) == .@"opaque");
+  return struct {
+    _allocation: []align(T.Signature.alignment.toByteUnits()) u8,
+
+    pub const Underlying = T;
+    const StaticSize = switch (options.serialization) {
+      .default, .noalign => T.Signature.static_size,
+      .pack => std.math.divCeil(comptime_int, T.Signature.static_size, 8),
+    };
+
+    pub fn init(allocator: std.mem.Allocator, val: *const T.Signature.T) !@This() {
+      const allocation_size: usize = StaticSize + if (std.meta.hasFn(T, "getDynamicSize")) T.getDynamicSize(val) else 0;
+      const allocation = try allocator.alignedAlloc(u8, T.Signature.alignment.toByteUnits(), allocation_size);
+      const written = T.write(val, allocation, 0, allocation[StaticSize..]);
+      if (@TypeOf(written) != void) std.debug.assert(written == allocation_size - StaticSize);
+      return @This(){ ._allocation = allocation };
+    }
+
+    pub fn clone(self: *const @This(), allocator: std.mem.Allocator) !@This() {
+      return .{ ._allocation = try allocator.dupe(u8, self._allocation) };
+    }
+
+    pub fn deinit(self: *const @This(), allocator: std.mem.Allocator) void {
+      allocator.free(self._allocation);
+    }
+
+    pub fn sub(self: @This()) WrapSub(T, options) {
+      return .{ ._static = self._allocation[0..StaticSize], ._offset = 0, ._dynamic = self._allocation[StaticSize..] };
+    }
+  };
+}
+
+pub fn WrapSub(T: type, options: ToSerializableOptions) type {
+  std.debug.assert(@typeInfo(T) == .@"opaque");
+  return struct {
+    _static: []u8,
+    _dynamic: []u8,
+    _offset: if (options.serialization == .pack) u3 else u0 = 0,
+
+    pub const Underlying = T;
+    const StaticSize = switch (options.serialization) {
+      .default, .noalign => T.Signature.static_size,
+      .pack => std.math.divCeil(comptime_int, T.Signature.static_size, 8),
+    };
+
+    const GetFnInfo = @typeInfo(@TypeOf(Underlying.GS.get)).@"fn";
+    const RawReturnType = GetFnInfo.return_type orelse void;
+    const GetParam1 = if (GetFnInfo.params.len == 1) void else GetFnInfo.params[1].type.?;
+
+    fn _raw_comptime(self: @This(), comptime arg: []const u8) Underlying.GS._getField(arg).type.GS {
+      return T.read(self._static, self._offset, self._dynamic).get(arg);
+    }
+    fn _raw_runtime(self: @This(), arg: GetParam1) RawReturnType {
+      return T.read(self._static, self._offset, self._dynamic).get(arg);
+    }
+    fn _raw(self: @This()) RawReturnType {
+      return T.read(self._static, self._offset, self._dynamic).get();
+    }
+
+    /// This function has an integral second argument if the underlying type is an array or a slice
+    /// This function has a comptime []const u8 as second argument if the underlying type is a struct
+    pub const raw = if (GetParam1 == void) _raw else if (GetParam1 == []const u8) _raw_comptime else _raw_runtime;
+
+    const GetReturnType = RawReturnType.Wrapped;
+    fn _get_comptime(self: @This(), comptime arg: []const u8) Underlying.GS._getField(arg).type.GS.Wrapped {
+      return raw(self, arg).wrap();
+    }
+    fn _get_runtime(self: @This(), arg: GetParam1) GetReturnType {
+      return raw(self, arg).wrap();
+    }
+    fn _get(self: @This()) GetReturnType {
+      return raw(self).wrap();
+    }
+
+    /// This function has an integral second argument if the underlying type is an array or a slice
+    /// This function has a comptime []const u8 as second argument if the underlying type is a struct
+    /// return_type of this function is another wrapped type, unlike raw
+    pub const get = if (GetParam1 == void) _get else if (GetParam1 == []const u8) _get_comptime else _get_runtime;
+
+    const SetFnInfo = @typeInfo(@TypeOf(Underlying.GS.set)).@"fn";
+    pub fn set(self: @This(), val: SetFnInfo.params[1].type.?) void {
+      T.read(self._static, self._offset, self._dynamic).set(val);
+    }
+
+    pub fn go(self: @This(), args: anytype) GoIndexRT(@TypeOf(args), 0) {
+      return self.goIndex(args, 0);
+    }
+
+    pub fn goIndex(self: @This(), args: anytype, comptime index: comptime_int) GoIndexRT(@TypeOf(args), index) {
+      const field_val = @field(args, std.fmt.comptimePrint("{d}", .{index}));
+      const is_void = @TypeOf(field_val) == void;
+      const sub_val = if (is_void) self.sub() else self.sub(field_val);
+      if (@typeInfo(@TypeOf(args)).@"struct".fields.len == index + 1) return sub_val;
+      return unrevel(sub_val, args, index + 1);
+    }
+
+    fn unrevel(self: @This(), subval: anytype, args: anytype, comptime index: comptime_int) void {
+      if (@typeInfo(@TypeOf(args)).@"struct".fields.len == index + 1) return subval;
+      const field_val = @field(args, std.fmt.comptimePrint("{d}", .{index}));
+      const is_void = @TypeOf(field_val) == void;
+      return self.unrevel(switch (@typeInfo(@TypeOf(subval))) {
+        .error_union => if (is_void) subval catch unreachable else @compileError("arg must be void for error to be tried"),
+        .optional => if (is_void) subval.? else @compileError("arg must be void for optional to be unwrapped"),
+        .@"struct" => {
+          if (@hasDecl(@TypeOf(subval), "Underlying") and
+            @hasDecl(@TypeOf(subval).Underlying, "Signature") and
+            @TypeOf(@TypeOf(subval).Underlying.Signature) == serializer.SerializableSignature
+          ) return @TypeOf(subval).goIndex(subval, field_val, index) else @field(subval, field_val); // arg must be of type []const u8 to access struct fields
+        },
+        .@"union" => @field(subval, field_val),
+        else => unreachable,
+      }, subval, args, index + 1);
+    }
+
+    fn GoIndexRT(Args: type, index: comptime_int) type {
+      if (@typeInfo(Args).@"struct".fields.len == index + 1) return FnReturnType(get);
+      return UnrevelRT(RawReturnType, Args, index + 1);
+    }
+
+    fn UnrevelRT(V: type, Args: type, index: comptime_int) type {
+      if (@typeInfo(Args).@"struct".fields.len == index + 1) return V;
+      const field_val: std.builtin.Type.StructField = @typeInfo(Args).@"struct".fields[index];
+      return UnrevelRT(switch (@typeInfo(V)) {
+        .error_union => |ei| ei.payload,
+        .optional => |oi| oi.child,
+        .@"struct" => {
+          if (@hasDecl(V, "Underlying") and
+            @hasDecl(V.Underlying, "Signature") and
+            @TypeOf(V.Underlying.Signature) == serializer.SerializableSignature
+          ) return V.GoIndexRT(Args, index) else @FieldType(V, @as(field_val.type, @ptrCast(field_val.default_value_ptr.?)));
+        },
+        .@"union" => return @FieldType(V, @as(field_val.type, @ptrCast(field_val.default_value_ptr.?))),
+        else => unreachable, // Not enough fields
+      }, Args, index + 1);
+    }
+  };
+}
+
+// ========================================
+//                 Testing                 
+// ========================================
+
+test "WrapSuper and WrapSub integration" {
+  const TestStruct = struct {
+    a: i32,
+    b: []const u8,
+    c: [2]bool,
+  };
+
+  const options: root.ToSerializableOptions = .{ .T = TestStruct, .serialization = .default };
+  const SerializableT = try serializer.ToSerializableT(TestStruct, options, null);
+
+  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  defer _ = gpa.deinit();
+  const allocator = gpa.allocator();
+
+  const initial_value = TestStruct{
+    .a = -100,
+    .b = "hello",
+    .c = .{ true, false },
+  };
+
+  const super: WrapSuper(SerializableT, options) = try .init(allocator, &initial_value);
+  defer super.deinit(allocator);
+
+  const sub = super.sub();
+  std.debug.print("Static: {d}\nDynamic: {d}\n", .{ sub._static, sub._dynamic });
+  std.debug.print("Len: {d}\n", .{ sub.raw("b").len });
+
+  try testing.expectEqual(initial_value.a, sub.raw("a").get());
+  inline for (0..initial_value.b.len) |i| try testing.expectEqual(initial_value.b[i], sub.get("b").raw(i).get());
+  try testing.expectEqual(initial_value.c[0], sub.get("c").raw(0).get());
+  try testing.expectEqual(initial_value.c[1], sub.get("c").raw(1).get());
+
+  // writing
+
+  // const new_a = 999;
+  // const new_b_char = 'Z';
+  //
+  // sub.get("a").set(new_a);
+  // sub.get("b").get(0).set(new_b_char);
+  //
+  // const reader = SerializableT.read(super._allocation, 0, super._allocation[SerializableT.Signature.static_size..]);
+  // try testing.expectEqual(new_a, reader.get("a").get());
+  // try testing.expectEqual(new_b_char, reader.get("b").get(0).get());
+  //
+  // // 5. Test cloning
+  // const clone = try super.clone(allocator);
+  // defer clone.deinit(allocator);
+  //
+  // // Ensure the clone is a deep copy
+  // try testing.expect(super._allocation.ptr != clone._allocation.ptr);
+  // try testing.expectEqualSlices(u8, super._allocation, clone._allocation);
 }
 
