@@ -265,10 +265,10 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         .noalign => divCeil(comptime_int, @bitSizeOf(options.dynamic_len_type), 8),
         .pack => @bitSizeOf(options.dynamic_len_type),
       };
-      const StaticSize = switch (options.serialization) {
-        .default => @sizeOf(T),
-        .noalign => divCeil(comptime_int, @bitSizeOf(ai.child), 8) * ai.len,
-        .pack => @bitSizeOf(ai.child) * ai.len,
+      const StaticSize = ai.len * switch (options.serialization) {
+        .default => U.Signature.static_size,
+        .noalign => divCeil(comptime_int, @bitSizeOf(ai.child), 8),
+        .pack => @bitSizeOf(ai.child),
       };
 
       const Sint = GetDirectSerializableT(options.dynamic_len_type, options, null);
@@ -308,6 +308,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             }
             dwritten += len;
           }
+          return dwritten;
         }
 
         pub const getDynamicSize = if (IsStatic) void else _getDynamicSize;
@@ -530,7 +531,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
 
           pub fn get(self: @This(), comptime name: []const u8) FnReturnType(@TypeOf(getField(name).type.read)) {
             const ft = getField(name).type;
-            if (!@hasField(T, "\xffoff" ++ name) or !std.meta.hasFn(ft, "getDynamicSize")) return self.readStaticField(name);
+            if (!std.meta.hasFn(ft, "getDynamicSize")) return self.readStaticField(name);
             const soffset: usize = getStaticOffset(name);
             const offset = self.readStaticField("\xffoff" ++ name).get();
             return ft.read(self.static[switch (options.serialization) {
@@ -794,10 +795,14 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           const active_tag = std.meta.activeTag(val.*);
           inline for (UFields) |f| {
             const ftag = comptime std.meta.stringToEnum(TagType, f.name);
-            const fv = @field(val, f.name);
-            if (ftag == active_tag) return f.type.getDynamicSize(&fv);
+            if (ftag == active_tag) {
+              if (std.meta.hasFn(f.type, "getDynamicSize")) {
+                const fv = @field(val, f.name);
+                return f.type.getDynamicSize(&fv);
+              } else return 0;
+            }
           }
-          unreachable;
+          unreachable; // Should never happen
         }
 
         pub const GS = struct {
@@ -948,6 +953,7 @@ fn _testSerializationDeserialization(comptime options: ToSerializableOptions, va
     }
   }
 
+  // std.debug.print("Static: {d}\nDynamic: {d}\n", .{ static_buffer, dynamic_buffer[0..dynamic_size] });
   try expectEqual(value, reader);
 }
 
@@ -1079,5 +1085,120 @@ test "unions" {
   try testSerialization(Payload{ .a = 99 });
   try testSerialization(Payload{ .b = false });
   try testSerialization(Payload{ .c = {} });
+}
+
+test "complex struct" {
+  const Nested = struct {
+    c: u4,
+    d: bool,
+  };
+
+  const KitchenSink = struct {
+    a: i32,
+    b: []const u8,
+    c: [2]Nested,
+    d: ?*const i32,
+    e: f32,
+  };
+
+  var value = KitchenSink{
+    .a = -1,
+    .b = "dynamic slice",
+    .c = .{ .{ .c = 1, .d = true }, .{ .c = 2, .d = false } },
+    .d = &@as(i32, 42),
+    .e = 3.14,
+  };
+
+  try testSerialization(value);
+
+  value.b = "";
+  try testSerialization(value);
+
+  value.d = null;
+  try testSerialization(value);
+}
+
+test "slice of complex structs" {
+  const Item = struct {
+    id: u64,
+    name: []const u8,
+    is_active: bool,
+  };
+
+  const items = [_]Item{
+    .{ .id = 1, .name = "first", .is_active = true },
+    .{ .id = 2, .name = "second", .is_active = false },
+    .{ .id = 3, .name = "", .is_active = true },
+  };
+
+  try testSerialization(items[0..]);
+}
+
+test "complex composition" {
+  const Complex1 = struct {
+    a: u32,
+    b: u32,
+    c: u32,
+  };
+
+  const Complex2 = struct {
+    a: Complex1,
+    b: []const Complex1,
+  };
+
+  const SuperComplex = struct {
+    a: Complex1,
+    b: Complex2,
+    c: []const union(enum) {
+      a: Complex1,
+      b: Complex2,
+    },
+  };
+
+  const value = SuperComplex{
+    .a = .{ .a = 1, .b = 2, .c = 3 },
+    .b = .{
+      .a = .{ .a = 4, .b = 5, .c = 6 },
+      .b = &.{ .{ .a = 7, .b = 8, .c = 9 } }
+    },
+    .c = &.{
+      .{ .a = .{ .a = 10, .b = 11, .c = 12 } },
+      .{ .b = .{ .a = .{ .a = 13, .b = 14, .c = 15 }, .b = &.{ .{ .a = 16, .b = 17, .c = 18 } } } }
+    },
+  };
+
+  try testSerialization(value);
+}
+
+test "multiple dynamic fields" {
+  const MultiDynamic = struct {
+    a: []const u8,
+    b: i32,
+    c: []const u8,
+  };
+
+  var value = MultiDynamic{
+    .a = "hello",
+    .b = 12345,
+    .c = "world",
+  };
+  try testSerialization(value);
+
+  value.a = "";
+  try testSerialization(value);
+}
+
+test "complex array" {
+  const ReorderStruct = struct {
+    a: u8,
+    b: u32, // Will be reordered with 'a'
+  };
+  const value = [2]ReorderStruct{
+    .{ .a = 1, .b = 100 },
+    .{ .a = 2, .b = 200 },
+  };
+
+  // This will test if the size calculation for the array is correct,
+  try testSerialization(value);
 }
 
