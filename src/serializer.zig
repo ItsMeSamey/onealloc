@@ -919,7 +919,6 @@ fn _testSerializationDeserialization(comptime options: ToSerializableOptions, va
     try std.testing.expectEqual(static_size_bytes, reader.static.len);
   }
 
-  std.io.getStdErr().writeAll(std.fmt.comptimePrint("{any}\n", .{options})) catch unreachable;
   try expectEqual(value, reader);
 }
 
