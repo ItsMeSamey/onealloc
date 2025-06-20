@@ -150,10 +150,8 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             return U.write(val.*, static, offset, dynamic);
           }
 
-          pub const getDynamicSize = if (FnReturnType(@TypeOf(U.write)) == void) void else _getDynamicSize;
-          pub fn _getDynamicSize(val: *const T) usize {
-            return U.getDynamicSize(val.*);
-          }
+          pub const getDynamicSize = if (std.meta.hasFn(U, "getDynamicSize")) _getDynamicSize else void;
+          pub fn _getDynamicSize(val: *const T) usize { return U.getDynamicSize(val.*); }
 
           pub const GS = U.GS;
           pub const read = U.read;
@@ -177,7 +175,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         const Dint = GetDirectSerializableT(options.dynamic_len_type, next_options, align_hint);
 
         break :blk opaque {
-          const SubStatic = FnReturnType(@TypeOf(U.write)) == void;
+          const SubStatic = !std.meta.hasFn(U, "getDynamicSize");
           pub const Signature = SerializableSignature{
             .T = T,
             .U = U,
@@ -277,7 +275,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
 
       break :blk opaque {
         const I = std.meta.Int(.unsigned, Signature.static_size);
-        const IsStatic = FnReturnType(@TypeOf(U.write)) == void;
+        const IsStatic = !std.meta.hasFn(U, "getDynamicSize");
         pub const Signature = SerializableSignature{
           .T = T,
           .U = U,
@@ -287,9 +285,10 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
 
         pub fn write(val: *const T, static: [] u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(@TypeOf(U.write)) {
           var dwritten: if (IsStatic) void else options.dynamic_len_type = if (IsStatic) {} else 0;
+          const index_size = if (IsStatic or ai.len == 0) 0 else IndexSize * (ai.len - 1);
           inline for (0..ai.len) |i| {
             const swritten_idx = if (IsStatic or i == 0) 0 else IndexSize * (i - 1);
-            const swritten = swritten_idx + U.Signature.static_size * i;
+            const swritten = index_size + U.Signature.static_size * i;
             const len = U.write(&val[i], static[switch (options.serialization) {
               .default, .noalign => swritten,
               .pack => swritten >> 3,
@@ -326,8 +325,9 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
 
           pub fn get(self: @This(), i: options.dynamic_len_type) U.GS {
             if (ai.len == 0) @compileError("Cannot get 0 length array");
+            const index_size = if (IsStatic or ai.len == 0) 0 else IndexSize * (ai.len - 1);
             const sindex_offset = if (IsStatic or i == 0) 0 else IndexSize * (i - 1);
-            const soffset = sindex_offset + U.Signature.static_size * i;
+            const soffset = index_size + U.Signature.static_size * i;
             const doffset = if (IsStatic) {} else if (i == 0) 0 else Sint.read(self.static[switch (options.serialization) {
               .default, .noalign => sindex_offset,
               .pack => (sindex_offset + self.offset) >> 3,
@@ -382,15 +382,18 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         }
 
         const sortfn = struct {
-          /// Rhs and Lhs are reversed because we want to sort in reverse order
-          fn inner(_: void, rhs: std.builtin.Type.StructField, lhs: std.builtin.Type.StructField) bool {
+          fn lteq(_: void, lhs: std.builtin.Type.StructField, rhs: std.builtin.Type.StructField) bool {
             return switch (options.serialization) {
-              .default => if (lhs.alignment < rhs.alignment) true
-                else lhs.type.Signature.static_size < rhs.type.Signature.static_size,
+              .default => if (lhs.alignment <= rhs.alignment) true
+                else lhs.type.Signature.static_size <= rhs.type.Signature.static_size,
               .noalign, .pack => if (lhs.type.Signature.static_size == 0) rhs.type.Signature.static_size != 0
-                else if (@ctz(@as(usize, lhs.type.Signature.static_size)) < @ctz(@as(usize, rhs.type.Signature.static_size))) true
-                else lhs.type.Signature.static_size < rhs.type.Signature.static_size,
+                else if (@ctz(@as(usize, lhs.type.Signature.static_size)) <= @ctz(@as(usize, rhs.type.Signature.static_size))) true
+                else lhs.type.Signature.static_size <= rhs.type.Signature.static_size,
             };
+          }
+          /// Rhs and Lhs are reversed because we want to sort in reverse order
+          fn inner(_: void, lhs: std.builtin.Type.StructField, rhs: std.builtin.Type.StructField) bool {
+            return !lteq({}, rhs, lhs);
           }
         }.inner;
 
@@ -399,7 +402,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         var is_first = true;
 
         // Add offset int field for all but the first field, first field has u0 instead
-        for (si.fields) |f| {
+        for (fields_slice) |f| {
           if (std.meta.hasFn(f.type, "getDynamicSize")) {
             fields_slice = fields_slice ++ [1]std.builtin.Type.StructField{std.builtin.Type.StructField{
               .name = "\xffoff" ++ f.name,
@@ -439,51 +442,73 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           .alignment = if (options.serialization == .default) .fromByteUnits(@alignOf(T)) else .@"1",
         };
 
+        fn errorCantFindField(comptime name: []const u8) noreturn {
+          @compileLog("Field " ++ name ++ " has type " ++ @typeName(getField(name).type.Signature.T), .{});
+          @compileLog("=" ** 30);
+          @compileError("Field '" ++ name ++ "' not found in struct '" ++ @typeName(T) ++ "'");
+        }
+
         fn getField(comptime name: []const u8) std.builtin.Type.StructField {
           for (UFields) |f| if (std.mem.eql(u8, f.name, name)) return f;
-          unreachable;
+          errorCantFindField(name);
+        }
+
+        fn getStaticOffset(comptime name: []const u8) comptime_int {
+          comptime var soffset: usize = 0;
+          inline for (UFields) |f| {
+            if (!comptime std.mem.eql(u8, f.name, name)) {
+              soffset += f.type.Signature.static_size;
+            } else {
+              return soffset;
+            }
+          }
+          errorCantFindField(name);
         }
 
         /// Returns the number of dynamic bytes written
         pub fn write(val: *const T, static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) if (IsStatic) void else options.dynamic_len_type {
-          comptime var swritten: usize = 0;
           var dwritten: if (IsStatic) void else options.dynamic_len_type = if (IsStatic) {} else 0;
           inline for (UFields) |f| {
-            if (comptime blk: {
-              if (!std.mem.startsWith(u8, f.name, "\xffoff")) break :blk false;
-              const name = if (f.name.len > 4) f.name[4..] else "";
-              if (!@hasField(T, name)) break :blk false;
-              break :blk std.meta.hasFn(getField(name).type, "getDynamicSize");
-            }) continue;
+            comptime if ( // Skip if this is an offset field
+              std.mem.startsWith(u8, f.name, "\xffoff") and
+              !@hasField(T, f.name) and @hasField(T, f.name[4..]) and
+              std.meta.hasFn(getField(f.name[4..]).type, "getDynamicSize")
+            ) continue;
+
+            const soffset: usize = getStaticOffset(f.name);
             const fval = @field(val.*, f.name); // Copy value because we wanna support packed structs!
             const len = f.type.write(&fval, static[switch (options.serialization) {
-              .default, .noalign => swritten,
-              .pack => (swritten + offset) >> 3,
+              .default, .noalign => soffset,
+              .pack => (soffset + offset) >> 3,
             }..], switch (options.serialization) {
               .default, .noalign => 0,
-              .pack => @intCast((swritten + offset) & 0b111),
-            }, dynamic);
-            swritten += f.type.Signature.static_size;
-            if (comptime @TypeOf(len) == void) continue; // Only static fields return void
+              .pack => @intCast((soffset + offset) & 0b111),
+            }, if (IsStatic) undefined else dynamic[dwritten..]);
+            if (@TypeOf(len) == void) continue; // Only static fields return void
 
-            const result = @FieldType(T, "\xffoff" ++ f.name).write(if (dwritten == 0) &@as(u0, 0) else &dwritten, static[switch (options.serialization) {
-              .default, .noalign => swritten,
-              .pack => (swritten + offset) >> 3,
+            const off_name = "\xffoff" ++ f.name;
+            const off_offset: usize = getStaticOffset(off_name);
+            const off_type = getField(off_name).type;
+            if (off_type.Signature.T == u0) std.debug.assert(0 == dwritten);
+            const result = off_type.write(if (off_type.Signature.T == u0) &@as(u0, 0) else &dwritten, static[switch (options.serialization) {
+              .default, .noalign => off_offset,
+              .pack => (off_offset + offset) >> 3,
             }..], switch (options.serialization) {
               .default, .noalign => 0,
-              .pack => @intCast((swritten + offset) & 0b111),
+              .pack => @intCast((off_offset + offset) & 0b111),
             }, undefined);
             std.debug.assert(@TypeOf(result) == void);
             dwritten += len;
           }
-          std.debug.assert(swritten == Signature.static_size);
           return dwritten;
         }
 
         pub const getDynamicSize = if (IsStatic) void else _getDynamicSize;
         pub fn _getDynamicSize(val: *const T) usize {
           var retval: usize = 0;
-          inline for (UFields) |f| retval += f.type.getDynamicSize(&@field(val.*, f.name));
+          inline for (UFields) |f| {
+            if (std.meta.hasFn(f.type, "getDynamicSize")) retval += f.type.getDynamicSize(&@field(val.*, f.name));
+          }
           return retval;
         }
 
@@ -491,18 +516,6 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           static: []u8,
           dynamic: []u8,
           offset: if (options.serialization == .pack) u3 else u0 = 0,
-
-          fn getStaticOffset(comptime name: []const u8) comptime_int {
-            comptime var soffset: usize = 0;
-            inline for (UFields) |f| {
-              if (!comptime std.mem.eql(u8, f.name, name)) {
-                soffset += f.type.Signature.static_size;
-              } else {
-                return soffset;
-              }
-            }
-            unreachable;
-          }
 
           fn readStaticField(self: @This(), comptime name: []const u8) FnReturnType(@TypeOf(getField(name).type.read)) {
             const soffset: usize = getStaticOffset(name);
@@ -518,7 +531,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           pub fn get(self: @This(), comptime name: []const u8) FnReturnType(@TypeOf(getField(name).type.read)) {
             const ft = getField(name).type;
             if (!@hasField(T, "\xffoff" ++ name) or !std.meta.hasFn(ft, "getDynamicSize")) return self.readStaticField(name);
-            const soffset: usize = self.getStaticOffset(name);
+            const soffset: usize = getStaticOffset(name);
             const offset = self.readStaticField("\xffoff" ++ name).get();
             return ft.read(self.static[switch (options.serialization) {
               .default, .noalign => soffset,
@@ -557,11 +570,11 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         };
 
         pub fn write(val: *const T, static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(@TypeOf(U.write)) {
-          const u = if (val.*) |v| @unionInit(Signature.U.Signature.T, "some", v ) else @unionInit(Signature.U.Signature.T, "none", {});
+          const u: Signature.U.Signature.T = if (val.*) |v| .{.some = v } else .{ .none = {} };
           U.write(&u, static, offset, dynamic);
         }
 
-        pub const getDynamicSize = if (FnReturnType(@TypeOf(U.write)) == void) void else _getDynamicSize;
+        pub const getDynamicSize = if (std.meta.hasFn(U, "getDynamicSize")) _getDynamicSize else void;
         pub fn _getDynamicSize(val: *const T) usize {
           return if (val.*) |v| Underlying.getDynamicSize(&v) else 0;
         }
@@ -603,11 +616,11 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
         };
 
         pub fn write(val: *const T, static: []u8, offset: if (options.serialization == .pack) u3 else u0, dynamic: []u8) FnReturnType(@TypeOf(U.write)) {
-          const u = if (val.*) |v| @unionInit(Signature.U.Signature.T, "ok", v) else |e| @unionInit(Signature.U.Signature.T, "err", e);
+          const u: Signature.U.Signature.T = if (val.*) |v| .{ .ok = v } else |e| .{ .err = e };
           U.write(&u, static, offset, dynamic);
         }
 
-        pub const getDynamicSize = if (FnReturnType(@TypeOf(U.write)) == void) void else _getDynamicSize;
+        pub const getDynamicSize = if (std.meta.hasFn(U, "getDynamicSize")) _getDynamicSize else void;
         pub fn _getDynamicSize(val: *const T) usize {
           return if (!std.meta.isError(val.*)) Underlying.getDynamicSize(&(val.* catch unreachable)) else 0;
         }
@@ -852,7 +865,10 @@ fn expectEqual(expected: anytype, actual: anytype) !void {
     .type, .noreturn, .comptime_float, .comptime_int, .undefined, .null, .error_set, .@"fn", .frame, .@"anyframe", .vector, .enum_literal =>
       @compileError(std.fmt.comptimePrint("Unreachable: {s}", .{@typeName(@TypeOf(expected))})),
     .void, .bool, .int, .float, .@"enum" => try expectEqual(expected, actual.get()),
-    .array => |ai| inline for (0..ai.len) |i| try expectEqual(expected[i], actual.get(i)),
+    .array => |ai| inline for (0..ai.len) |i| expectEqual(expected[i], actual.get(i)) catch |e| {
+      std.debug.print("Failed at array index {d}\n", .{i});
+      return e;
+    },
     .pointer => |pi| switch (pi.size) {
       .one => {
         const info = @typeInfo(FnReturnType(@TypeOf(@TypeOf(actual).get)));
@@ -861,11 +877,17 @@ fn expectEqual(expected: anytype, actual: anytype) !void {
       },
       .slice => {
         try std.testing.expectEqual(expected.len, actual.len);
-        for (0..expected.len) |i| try expectEqual(expected[i], actual.get(i));
+        for (0..expected.len) |i| expectEqual(expected[i], actual.get(i)) catch |e| {
+          std.debug.print("Failed at slice index {d}\n", .{i});
+          return e;
+        };
       },
       .c, .many => try expectEqual(expected, actual.get()),
     },
-    .@"struct" => |si| inline for (si.fields) |f| try expectEqual(@field(expected, f.name), actual.get(f.name)),
+    .@"struct" => |si| inline for (si.fields) |f| expectEqual(@field(expected, f.name), actual.get(f.name)) catch |e| {
+      std.debug.print("Failed on field {s}\n", .{f.name});
+      return e;
+    },
     .optional => {
       const gotten = actual.get();
       if (expected == null or gotten == null) {
@@ -885,7 +907,10 @@ fn expectEqual(expected: anytype, actual: anytype) !void {
       try expectEqual(std.meta.activeTag(expected), std.meta.activeTag(gotten));
       inline for (std.meta.fields(@TypeOf(expected))) |f| {
         if (std.meta.activeTag(expected) == comptime std.meta.stringToEnum(ui.tag_type.?, f.name)) {
-          return expectEqual(@field(expected, f.name), @field(gotten, f.name));
+          return expectEqual(@field(expected, f.name), @field(gotten, f.name)) catch |e| {
+            std.debug.print("Failed on union field {s}\n", .{f.name});
+            return e;
+          };
         }
       }
       unreachable;
