@@ -4,11 +4,10 @@ const root = @import("root.zig");
 const meta = @import("meta.zig");
 
 const FnReturnType = meta.FnReturnType;
-const ToSerializableOptions = root.ToMergedOptions;
 const native_endian = builtin.cpu.arch.endian();
 
 pub const ToMergedOptions = struct {
-  /// The type that is to be deserialized
+  /// The type that is to be merged
   T: type,
 
   recurse: comptime_int = 1024,
@@ -45,10 +44,10 @@ pub const ToMergedOptions = struct {
   } = .disallow,
 };
 
-/// This is used to recognize if types were rFneturned by ToSerializable.
-/// This is done by assigning `pub const Signature = SerializableSignature;` inside an opaque
+/// This is used to recognize if types were returned by ToMerged.
+/// This is done by assigning `pub const Signature = MergedSignature;` inside an opaque
 pub const MergedSignature = struct {
-  /// The underlying type that was transformed (to down)
+  /// The underlying type that was transformed
   T: type,
   /// Static size (in bits if pack, in bytes if default/noalign)
   static_size: comptime_int,
@@ -169,12 +168,12 @@ pub fn GetDirectMergedT(T: type, context: Context) type {
     };
     const B = Bytes(Signature.alignment);
 
-    pub fn write(val: *const T, static: B, _: B) void {
+    pub fn write(val: *const T, static: B, _: void) void {
       if (@bitSizeOf(T) == 0) return;
       @memcpy(static.slice(Signature.static_size), std.mem.asBytes(val.*));
     }
 
-    pub fn read(static: B, _: B) *T {
+    pub fn read(static: B, _: void) *T {
       return @ptrCast(static.ptr);
     }
   };
@@ -183,11 +182,13 @@ pub fn GetDirectMergedT(T: type, context: Context) type {
 pub fn GetOnePointerMergedT(T: type, context: Context) !type {
   const pi = @typeInfo(T).pointer;
   std.debug.assert(pi.size == .one);
+
   var next_options = context.options;
   next_options.dereference -= 1;
   const next_context = context.reop(next_options).see(T);
   if (next_context.times_left == -1) return GetDirectMergedT(T, context);
-  const Child = try ToSerializableT(pi.child, next_context);
+
+  const Child = try ToMergedT(pi.child, next_context);
 
   return opaque {
     const B = Bytes(Signature.alignment);
@@ -206,6 +207,63 @@ pub fn GetOnePointerMergedT(T: type, context: Context) !type {
 
     pub const GS = Child.GS;
     pub const read = Child.read;
+  };
+}
+
+pub fn GetSliceMergedT(T: type, context: Context) !type {
+  const pi = @typeInfo(T).pointer;
+  std.debug.assert(pi.size == .one);
+
+  var next_options = context.options;
+  next_options.deslice -= 1;
+  const next_context = context.reop(next_options).realign(.fromByteUnits(pi.alignment)).see(T);
+  if (next_context.times_left == -1) return GetDirectMergedT(T, context);
+  
+  const Static = GetDirectMergedT(T, context);
+  const Child = try ToMergedT(pi.child, next_context);
+  const SubStatic = !std.meta.hasFn(Child, "getDynamicSize");
+
+  return opaque {
+    const S = Bytes(Signature.alignment);
+    const D = Bytes(Child.Signature.alignment);
+    pub const Signature = MergedSignature{
+      .T = T,
+      .static_size = Static.Signature.static_size,
+      .alignment = Static.Signature.alignment,
+    };
+
+    pub fn write(val: *const T, _static: S, _dynamic: D) usize {
+      const len = val.*.len;
+      var to_write = val.*;
+      to_write.ptr = @ptrCast(_dynamic.ptr);
+      Static.write(&to_write, _static, undefined);
+      if (len == 0) return 0;
+
+      var offset: usize = 0;
+      var dwritten: if (SubStatic) void else usize = if (SubStatic) {} else 0;
+      const static = _dynamic.till(Child.Signature.static_size * len);
+      const dynamic = _dynamic.from(Child.Signature.static_size * len);
+      for (0..len) |i| {
+        const written = Child.write(&val.*[i], static.from(offset), if (SubStatic) undefined else dynamic.from(dwritten));
+        offset += Child.Signature.static_size;
+        if (comptime !SubStatic) dwritten += written;
+      }
+
+      return offset + if (SubStatic) 0 else dwritten;
+    }
+
+    pub fn getDynamicSize(val: *const T) usize {
+      if (val.*.len == 0) return 0;
+      var retval: usize = Child.Signature.static_size * val.*.len;
+      if (!SubStatic) {
+        for (val.*) |v| retval += Child.getDynamicSize(&v);
+      }
+      return retval;
+    }
+
+    pub fn read(static: S, _: D) *T {
+      return @ptrCast(static.ptr);
+    }
   };
 }
 
