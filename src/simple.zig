@@ -316,3 +316,46 @@ pub fn GetSliceMergedT(T: type, context: Context) !type {
   };
 }
 
+pub fn GetArrayMergedT(T: type, context: Context) !type {
+  const ai = @typeInfo(T).array;
+  const Child = try ToMergedT(ai.child, context.realign(null));
+
+  // If the child has no dynamic data, the entire array is static.
+  // We can treat it as a direct memory copy.
+  if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(T, context);
+
+  return opaque {
+    const S = Bytes(Signature.alignment);
+
+    pub const Signature = MergedSignature{
+      .T = T,
+      .D = Child.Signature.D,
+      .static_size = Child.Signature.static_size * ai.len,
+      .alignment = context.align_hint orelse .fromByteUnits(@alignOf(T)),
+    };
+
+    pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
+      std.debug.assert(std.mem.isAligned(static.ptr, Signature.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(dynamic.ptr, Signature.D.alignment.toByteUnits()));
+      
+      var child_static = static.till(Signature.static_size);
+      var child_dynamic = dynamic;
+
+      for (val.*) |*item| {
+        const written = Child.write(item, child_static, child_dynamic);
+        child_static = child_static.from(Child.Signature.static_size);
+        child_dynamic = child_dynamic.from(written);
+      }
+
+      return @intFromPtr(child_dynamic.ptr) - @intFromPtr(dynamic.ptr);
+    }
+
+    pub fn getDynamicSize(val: *const T, size: usize) usize {
+      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment.toByteUnits()));
+      var new_size = size;
+      inline for (0..ai.len) |i| new_size = Child.getDynamicSize(&val[i], new_size);
+      return new_size;
+    }
+  };
+}
+
