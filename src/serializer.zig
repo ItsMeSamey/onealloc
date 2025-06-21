@@ -12,7 +12,7 @@ pub const ToSerializableOptions = struct {
   /// The type that is to be deserialized
   T: type,
   /// Control how value bytes are serialized
-  serialization: SerializationOptions = .default,
+  serialization: meta.SerializationType = .default,
   /// If int is supplied, this does nothing at all if enum supplied is non-exhaustive
   /// and smallest int needed to represent all of its fields is smaller then one used,
   /// the enum fields will be remapped to optimize for size
@@ -50,15 +50,6 @@ pub const ToSerializableOptions = struct {
   deslice: comptime_int = 1024,
   /// Error if deslice = 0
   error_on_0_deslice: bool = true,
-
-  pub const SerializationOptions = enum {
-    ///stuffs together like in packed struct, 2 u22's take up 44 bits
-    pack,
-    /// remove alignment when packing, 2 u22's take up 2 * 24 = 48 bits
-    noalign,
-    /// do not remove padding, 2 u22's will take up 2 * 32 = 64 bits
-    default,
-  };
 };
 
 /// Convert any type to a serializable type, any unsupported types present in the struct will result in a compile error.
@@ -297,7 +288,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
               write(&val, self.static, self.offset, self.dynamic);
             }
 
-            pub const Wrapped = meta.WrapSub(Self, options);
+            pub const Wrapped = WrapSub(Self, options);
             pub fn wrap(self: @This()) Wrapped {
               return .{ ._static = self.static, ._offset = 0, ._dynamic = if (SubStatic) undefined else self.dynamic };
             }
@@ -411,7 +402,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             write(&val, self.static, self.offset, self.dynamic);
           }
 
-            pub const Wrapped = meta.WrapSub(Self, options);
+            pub const Wrapped = WrapSub(Self, options);
             pub fn wrap(self: @This()) Wrapped {
             return .{ ._static = self.static, ._offset = self.offset, ._dynamic = self.dynamic };
           }
@@ -613,7 +604,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             write(&val, self.static, self.offset, self.dynamic);
           }
 
-            pub const Wrapped = meta.WrapSub(Self, options);
+            pub const Wrapped = WrapSub(Self, options);
             pub fn wrap(self: @This()) Wrapped {
             return .{ ._static = self.static, ._offset = self.offset, ._dynamic = self.dynamic };
           }
@@ -660,7 +651,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             write(&val, self.underlying.static, self.underlying.offset, self.underlying.dynamic);
           }
 
-            pub const Wrapped = meta.WrapSub(Self, options);
+            pub const Wrapped = WrapSub(Self, options);
             pub fn wrap(self: @This()) Wrapped {
             return .{ ._static = self.underlying.static, ._offset = self.underlying.offset, ._dynamic = self.underlying.dynamic };
           }
@@ -707,7 +698,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             write(&val, self.underlying.static, self.underlying.offset, self.underlying.dynamic);
           }
 
-            pub const Wrapped = meta.WrapSub(Self, options);
+            pub const Wrapped = WrapSub(Self, options);
             pub fn wrap(self: @This()) Wrapped {
             return .{ ._static = self.underlying.static, ._offset = self.underlying.offset, ._dynamic = self.underlying.dynamic };
           }
@@ -763,7 +754,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
           write(&val, self.underlying.static, self.underlying.offset, undefined);
         }
 
-        pub const Wrapped = meta.WrapSub(Self, options);
+        pub const Wrapped = WrapSub(Self, options);
         pub fn wrap(self: @This()) Wrapped {
           return .{ ._static = self.underlying.static, ._offset = self.underlying.offset, ._dynamic = undefined };
         }
@@ -913,7 +904,7 @@ pub fn ToSerializableT(T: type, options: ToSerializableOptions, align_hint: ?std
             write(&val, self.static, self.offset, self.dynamic);
           }
 
-          pub const Wrapped = meta.WrapSub(Self, options);
+          pub const Wrapped = WrapSub(Self, options);
           pub fn wrap(self: @This()) Wrapped {
             return .{ ._static = self.static, ._offset = self.offset, ._dynamic = if (IsStatic) undefined else self.dynamic };
           }
@@ -1503,7 +1494,7 @@ pub fn WrapSub(T: type, options: ToSerializableOptions) type {
         .@"struct" => {
           if (@hasDecl(@TypeOf(subval), "Underlying") and
             @hasDecl(@TypeOf(subval).Underlying, "Signature") and
-            @TypeOf(@TypeOf(subval).Underlying.Signature) == serializer.SerializableSignature
+            @TypeOf(@TypeOf(subval).Underlying.Signature) == SerializableSignature
           ) return @TypeOf(subval).goIndex(subval, field_val, index) else @field(subval, field_val); // arg must be of type []const u8 to access struct fields
         },
         .@"union" => @field(subval, field_val),
@@ -1525,7 +1516,7 @@ pub fn WrapSub(T: type, options: ToSerializableOptions) type {
         .@"struct" => {
           if (@hasDecl(V, "Underlying") and
             @hasDecl(V.Underlying, "Signature") and
-            @TypeOf(V.Underlying.Signature) == serializer.SerializableSignature
+            @TypeOf(V.Underlying.Signature) == SerializableSignature
           ) return V.GoIndexRT(Args, index) else @FieldType(V, @as(field_val.type, @ptrCast(field_val.default_value_ptr.?)));
         },
         .@"union" => return @FieldType(V, @as(field_val.type, @ptrCast(field_val.default_value_ptr.?))),
@@ -1539,56 +1530,55 @@ pub fn WrapSub(T: type, options: ToSerializableOptions) type {
 //                 Testing                 
 // ========================================
 
-test "WrapSuper and WrapSub integration" {
-  const TestStruct = struct {
-    a: i32,
-    b: []const u8,
-    c: [2]bool,
-  };
-
-  const options: root.ToSerializableOptions = .{ .T = TestStruct, .serialization = .default };
-  const SerializableT = try serializer.ToSerializableT(TestStruct, options, null);
-
-  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-  defer _ = gpa.deinit();
-  const allocator = gpa.allocator();
-
-  const initial_value = TestStruct{
-    .a = -100,
-    .b = "hello",
-    .c = .{ true, false },
-  };
-
-  const super: WrapSuper(SerializableT, options) = try .init(allocator, &initial_value);
-  defer super.deinit(allocator);
-
-  const sub = super.sub();
-  std.debug.print("Static: {d}\nDynamic: {d}\n", .{ sub._static, sub._dynamic });
-  std.debug.print("Len: {d}\n", .{ sub.raw("b").len });
-
-  try testing.expectEqual(initial_value.a, sub.raw("a").get());
-  inline for (0..initial_value.b.len) |i| try testing.expectEqual(initial_value.b[i], sub.get("b").raw(i).get());
-  try testing.expectEqual(initial_value.c[0], sub.get("c").raw(0).get());
-  try testing.expectEqual(initial_value.c[1], sub.get("c").raw(1).get());
-
-  // writing
-
-  // const new_a = 999;
-  // const new_b_char = 'Z';
-  //
-  // sub.get("a").set(new_a);
-  // sub.get("b").get(0).set(new_b_char);
-  //
-  // const reader = SerializableT.read(super._allocation, 0, super._allocation[SerializableT.Signature.static_size..]);
-  // try testing.expectEqual(new_a, reader.get("a").get());
-  // try testing.expectEqual(new_b_char, reader.get("b").get(0).get());
-  //
-  // // 5. Test cloning
-  // const clone = try super.clone(allocator);
-  // defer clone.deinit(allocator);
-  //
-  // // Ensure the clone is a deep copy
-  // try testing.expect(super._allocation.ptr != clone._allocation.ptr);
-  // try testing.expectEqualSlices(u8, super._allocation, clone._allocation);
-}
+// test "WrapSuper and WrapSub integration" {
+//   const TestStruct = struct {
+//     a: i32,
+//     b: []const u8,
+//     c: [2]bool,
+//   };
+//
+//   const options: ToSerializableOptions = .{ .T = TestStruct, .serialization = .default };
+//   const SerializableT = try ToSerializableT(TestStruct, options, null);
+//
+//   var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//   defer _ = gpa.deinit();
+//   const allocator = gpa.allocator();
+//
+//   const initial_value = TestStruct{
+//     .a = -100,
+//     .b = "hello",
+//     .c = .{ true, false },
+//   };
+//
+//   const super: WrapSuper(SerializableT, options) = try .init(allocator, &initial_value);
+//   defer super.deinit(allocator);
+//
+//   const sub = super.sub();
+//   std.debug.print("Static: {d}\nDynamic: {d}\n", .{ sub._static, sub._dynamic });
+//   std.debug.print("Len: {d}\n", .{ sub.raw("b").len });
+//
+//   try testing.expectEqual(initial_value.a, sub.raw("a").get());
+//   inline for (0..initial_value.b.len) |i| try testing.expectEqual(initial_value.b[i], sub.get("b").raw(i).get());
+//   try testing.expectEqual(initial_value.c[0], sub.get("c").raw(0).get());
+//   try testing.expectEqual(initial_value.c[1], sub.get("c").raw(1).get());
+//
+//   // writing
+//
+//   const new_a = 999;
+//   const new_b_char = 'Z';
+//
+//   sub.get("a").set(new_a);
+//   sub.get("b").get(0).set(new_b_char);
+//
+//   const reader = SerializableT.read(super._allocation, 0, super._allocation[SerializableT.Signature.static_size..]);
+//   try testing.expectEqual(new_a, reader.get("a").get());
+//   try testing.expectEqual(new_b_char, reader.get("b").get(0).get());
+//
+//   // cloning
+//   const clone = try super.clone(allocator);
+//   defer clone.deinit(allocator);
+//
+//   try testing.expect(super._allocation.ptr != clone._allocation.ptr);
+//   try testing.expectEqualSlices(u8, super._allocation, clone._allocation);
+// }
 

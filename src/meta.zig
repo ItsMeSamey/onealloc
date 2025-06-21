@@ -10,9 +10,18 @@ pub fn FnReturnType(T: type) type {
   };
 }
 
+pub const SerializationType = enum {
+  ///stuffs together like in packed struct, 2 u22's take up 44 bits
+  pack,
+  /// remove alignment when packing, 2 u22's take up 2 * 24 = 48 bits
+  noalign,
+  /// do not remove padding, 2 u22's will take up 2 * 32 = 64 bits
+  default,
+};
+
 /// Shrink the enum type, if return type of this function is used, enum is guaranteed to not be shrunk (it is already shrunk)
 /// You can get the original enum value using `@enumFromInt(@typeInfo(OriginalEnumType).@"enum".fields[@intFromEnum(val)])`
-pub fn GetShrunkEnumType(T: type, serialization: root.ToSerializableOptions.SerializationOptions) type {
+pub fn GetShrunkEnumType(T: type, serialization: SerializationType) type {
   const ei = @typeInfo(T).@"enum";
   const min_bits = std.math.log2_int_ceil(usize, ei.fields.len);
   const TagType = std.meta.Int(.unsigned, min_bits);
