@@ -231,3 +231,8 @@ const List = onealloc.SimpleWrapper(.{ .T = NodeA, .allow_recursive_rereferencin
 // List with doubley recursive types merged into a contiguous allocation
 const copy = SimpleWrapper.init(allocator, a1);
 ```
+# Limitations
+1. Some recursive types are not supported (eg. doubley linked lists are not possible to serialize at all)
+2. Manual memory layout management: There is no wey to know the position of union tags, position of error in error union or tag in optional. I manually figured out their positions through trial and error, thus they may be incorrect in some cases.
+3. It is possible to make the data portable (not depend on the pointer values at all), this is not implimented as of now.
+4. Although i tested the code, there probably still are some bugs.
