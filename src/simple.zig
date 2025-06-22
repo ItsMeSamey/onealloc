@@ -707,3 +707,171 @@ pub fn ToMergedT(T: type, context: Context) type {
   };
 }
 
+// ========================================
+//                 Testing
+// ========================================
+
+const testing = std.testing;
+
+fn expectEqual(expected: anytype, actual: anytype) !void {
+  const print = std.debug.print;
+
+  switch (@typeInfo(@TypeOf(actual))) {
+    .noreturn, .@"opaque", .frame, .@"anyframe", => @compileError("value of type " ++ @typeName(@TypeOf(actual)) ++ " encountered"),
+
+    .void => return,
+
+    .type => {
+      if (actual != expected) {
+        print("expected type {s}, found type {s}\n", .{ @typeName(expected), @typeName(actual) });
+        return error.TestExpectedEqual;
+      }
+    },
+
+    .bool, .int, .float, .comptime_float, .comptime_int, .enum_literal, .@"enum", .@"fn", .error_set => {
+      if (actual != expected) {
+        print("expected {}, found {}\n", .{ expected, actual });
+        return error.TestExpectedEqual;
+      }
+    },
+
+    .pointer => |pointer| {
+      switch (pointer.size) {
+        .one, .many, .c => {
+          if (actual == expected) return;
+          return expectEqual(actual.*, expected.*);
+        },
+        .slice => {
+          if (actual.len != expected.len) {
+            print("expected slice len {}, found {}\n", .{ expected.len, actual.len });
+            return error.TestExpectedEqual;
+          }
+          if (actual.ptr == expected.ptr) return;
+          for (actual, expected, 0..) |va, ve, i| {
+            expectEqual(va, ve) catch |e| {
+              print("index {d} incorrect. expected {any}, found {any}\n", .{ i, expected[i], actual[i] });
+              return e;
+            };
+          }
+        },
+      }
+    },
+
+    .array => |array| {
+      inline for (array.len) |i| {
+        expectEqual(expected[i], actual[i]) catch |e| {
+          print("index {d} incorrect. expected {any}, found {any}\n", .{ i, expected[i], actual[i] });
+          return e;
+        };
+      }
+    },
+
+    .vector => |info| {
+      var i: usize = 0;
+      while (i < info.len) : (i += 1) {
+        if (!std.meta.eql(expected[i], actual[i])) {
+          print("index {d} incorrect. expected {any}, found {any}\n", .{ i, expected[i], actual[i] });
+          return error.TestExpectedEqual;
+        }
+      }
+    },
+
+    .@"struct" => |structType| {
+      inline for (structType.fields) |field| {
+        try expectEqual(@field(expected, field.name), @field(actual, field.name));
+      }
+    },
+
+    .@"union" => |union_info| {
+      if (union_info.tag_type == null) @compileError("Unable to compare untagged union values for type " ++ @typeName(@TypeOf(actual)));
+      const Tag = std.meta.Tag(@TypeOf(expected));
+      const expectedTag = @as(Tag, expected);
+      const actualTag = @as(Tag, actual);
+
+      try expectEqual(expectedTag, actualTag);
+
+      switch (expected) {
+        inline else => |val, tag| try expectEqual(val, @field(actual, @tagName(tag))),
+      }
+    },
+
+    .optional => {
+      if (expected) |expected_payload| {
+        if (actual) |actual_payload| {
+          try expectEqual(expected_payload, actual_payload);
+        } else {
+          print("expected {any}, found null\n", .{expected_payload});
+          return error.TestExpectedEqual;
+        }
+      } else {
+        if (actual) |actual_payload| {
+          print("expected null, found {any}\n", .{actual_payload});
+          return error.TestExpectedEqual;
+        }
+      }
+    },
+
+    .error_union => {
+      if (expected) |expected_payload| {
+        if (actual) |actual_payload| {
+          try expectEqual(expected_payload, actual_payload);
+        } else |actual_err| {
+          print("expected {any}, found {}\n", .{ expected_payload, actual_err });
+          return error.TestExpectedEqual;
+        }
+      } else |expected_err| {
+        if (actual) |actual_payload| {
+          print("expected {}, found {any}\n", .{ expected_err, actual_payload });
+          return error.TestExpectedEqual;
+        } else |actual_err| {
+          try expectEqual(expected_err, actual_err);
+        }
+      }
+    },
+
+    else => @compileError("Unsupported type in expectEqual: " ++ @typeName(@TypeOf(expected))),
+  }
+}
+
+fn _testSerializationDeserialization(value: anytype, comptime options: ToMergedOptions) !void {
+  const T = @TypeOf(value);
+  const MergedT = ToMergedT(T, .{
+    .align_hint = null,
+    .seen_types = &.{T},
+    .times_left = options.flatten_self_references,
+    .options = options,
+  });
+
+  const static_size = MergedT.Signature.static_size;
+  var static_buffer: [static_size]u8 = undefined;
+
+  const dynamic_size = if (std.meta.hasFn(MergedT, "getDynamicSize")) MergedT.getDynamicSize(&value, 0) else 0;
+  var dynamic_buffer: [4096]u8 = undefined;
+  if (dynamic_size > dynamic_buffer.len) {
+    std.log.err("dynamic buffer too small for test. need {d}, have {d}", .{ dynamic_size, dynamic_buffer.len });
+    return error.NoSpaceLeft;
+  }
+
+  const written_dynamic_size = MergedT.write(&value, .initAssert(&static_buffer), .initAssert(&dynamic_buffer));
+
+  std.debug.assert(written_dynamic_size == dynamic_size);
+  try expectEqual(&value, @as(*@TypeOf(value), @ptrFromInt(@intFromPtr(&static_buffer))));
+}
+
+fn testSerialization(value: anytype) !void {
+  try _testSerializationDeserialization(value, .{ .T = @TypeOf(value) });
+}
+
+test "primitives" {
+  try testSerialization(@as(u32, 42));
+  try testSerialization(@as(f64, 123.456));
+  try testSerialization(@as(bool, true));
+  try testSerialization(@as(void, {}));
+}
+
+test "pointers" {
+  var x: u64 = 12345;
+  try testSerialization(&x);
+  try _testSerializationDeserialization(&x, .{ .T = *u64, .dereference = 0, .error_on_0_dereference = false });
+}
+
