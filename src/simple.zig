@@ -63,26 +63,33 @@ const Context = struct {
     return retval;
   }
 
-  pub fn see(self: @This(), T: type, Result: type) @This() { // Yes we can do this, Zig is f****ing awesome
+  pub fn see(self: @This(), new_T: type, Result: type) @This() { // Yes we can do this, Zig is f****ing awesome
     const have_seen = comptime blk: {
-      for (self.seen_types, 0..) |t, i| if (meta.ContainsT(T, t)) break :blk i;
+      for (self.seen_types, 0..) |t, i| if (meta.ContainsT(new_T, t)) break :blk i;
       break :blk -1;
     };
 
     if (have_seen != -1 and !self.options.allow_recursive_rereferencing) {
-      @compileError("Recursive type " ++ @typeName(T) ++ " is not allowed to be referenced by another type");
+      @compileError("Recursive type " ++ @typeName(new_T) ++ " is not allowed to be referenced by another type");
     }
 
     var retval = self;
-    retval.seen_types = self.seen_types ++ [1]type{T};
+    retval.seen_types = self.seen_types ++ [1]type{new_T};
     retval.result_types = self.result_types ++ [1]type{Result};
     retval.seen_recursive = have_seen;
+    retval.options.T = new_T;
     return retval;
   }
 
   pub fn reop(self: @This(), options: ToMergedOptions) @This() {
     var retval = self;
     retval.options = options;
+    return retval;
+  }
+
+  pub fn T(self: @This(), comptime new_T: type) @This() {
+    var retval = self;
+    retval.options.T = new_T;
     return retval;
   }
 };
@@ -151,7 +158,8 @@ pub fn Bytes(comptime _alignment: std.mem.Alignment) type {
 
 /// We take in a type and just use its byte representation to store into bits.
 /// Zero-sized types ares supported and take up no space at all
-pub fn GetDirectMergedT(T: type, context: Context) type {
+pub fn GetDirectMergedT(context: Context) type {
+  const T = context.options.T;
   return opaque {
     const S = Bytes(Signature.alignment);
     pub const Signature = MergedSignature{
@@ -169,18 +177,19 @@ pub fn GetDirectMergedT(T: type, context: Context) type {
 }
 
 /// Convert a supplid pointer type to writable opaque
-pub fn GetOnePointerMergedT(T: type, context: Context) type {
-  if (!context.options.dereference) return GetDirectMergedT(T, context);
+pub fn GetOnePointerMergedT(context: Context) type {
+  const T = context.options.T;
+  if (!context.options.dereference) return GetDirectMergedT(context);
 
   const is_optional = if (@typeInfo(T) == .optional) true else false;
   const pi = @typeInfo(if (is_optional) @typeInfo(T).optional.child else T).pointer;
   std.debug.assert(pi.size == .one);
 
-  const Pointer = GetDirectMergedT(T, context);
+  const Pointer = GetDirectMergedT(context);
 
   const Retval = opaque {
     const next_context = context.realign(.fromByteUnits(pi.alignment)).see(T, @This());
-    const Child = ToMergedT(pi.child, next_context);
+    const Child = ToMergedT(next_context.T(pi.child));
 
     const S = Bytes(Signature.alignment);
     pub const Signature = MergedSignature{
@@ -226,17 +235,18 @@ pub fn GetOnePointerMergedT(T: type, context: Context) type {
   return Retval;
 }
 
-pub fn GetSliceMergedT(T: type, context: Context) type {
+pub fn GetSliceMergedT(context: Context) type {
+  const T = context.options.T;
   if (context.options.deslice == 0) {
     if (context.options.error_on_0_deslice) {
       @compileError("Cannot deslice type " ++ @typeName(T) ++ " any further as options.deslice is 0");
     }
-    return GetDirectMergedT(T, context);
+    return GetDirectMergedT(context);
   }
 
   const pi = @typeInfo(T).pointer;
   std.debug.assert(pi.size == .slice);
-  const Slice = GetDirectMergedT(T, context);
+  const Slice = GetDirectMergedT(context);
 
   const Retval = opaque {
     const next_context = context.realign(.fromByteUnits(pi.alignment)).see(T, @This());
@@ -245,7 +255,7 @@ pub fn GetSliceMergedT(T: type, context: Context) type {
       if (next_context.seen_recursive == -1) retval.deslice -= 1;
       break :blk retval;
     };
-    const Child = ToMergedT(pi.child, next_context.reop(next_options));
+    const Child = ToMergedT(next_context.reop(next_options).T(pi.child));
     const SubStatic = !std.meta.hasFn(Child, "getDynamicSize");
     const S = Bytes(Signature.alignment);
     pub const Signature = MergedSignature{
@@ -298,15 +308,16 @@ pub fn GetSliceMergedT(T: type, context: Context) type {
   return Retval;
 }
 
-pub fn GetArrayMergedT(T: type, context: Context) type {
+pub fn GetArrayMergedT(context: Context) type {
+  const T = context.options.T;
   @setEvalBranchQuota(1000_000);
   const ai = @typeInfo(T).array;
   // No need to .see(T) here as the child will handle this anyway and if the array type is repeated, the child will be too.
-  const Child = ToMergedT(ai.child, context.realign(null));
+  const Child = ToMergedT(context.realign(null).T(ai.child));
 
   // If the child has no dynamic data, the entire array is static.
   // We can treat it as a direct memory copy.
-  if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(T, context);
+  if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(context);
 
   return opaque {
     const S = Bytes(Signature.alignment);
@@ -347,9 +358,10 @@ pub fn GetArrayMergedT(T: type, context: Context) type {
   };
 }
 
-pub fn GetStructMergedT(T: type, context: Context) type {
+pub fn GetStructMergedT(context: Context) type {
+  const T = context.options.T;
   @setEvalBranchQuota(1000_000);
-  if (!context.options.recurse) return GetDirectMergedT(T, context);
+  if (!context.options.recurse) return GetDirectMergedT(context);
 
   const si = @typeInfo(T).@"struct";
 
@@ -366,7 +378,7 @@ pub fn GetStructMergedT(T: type, context: Context) type {
       var pfields: [si.fields.len]ProcessedField = undefined;
 
       for (si.fields, 0..) |f, i| {
-        const MergedChild = ToMergedT(f.type, next_context.realign(if (si.layout == .@"packed") .@"1" else .fromByteUnits(f.alignment)));
+        const MergedChild = ToMergedT(next_context.realign(if (si.layout == .@"packed") .@"1" else .fromByteUnits(f.alignment)).T(f.type));
         pfields[i] = .{
           .original = f,
           .merged = MergedChild,
@@ -426,18 +438,19 @@ pub fn GetStructMergedT(T: type, context: Context) type {
   };
 
   if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
-  if (Retval.FirstNonStaticT == si.fields.len) return GetDirectMergedT(T, context);
+  if (Retval.FirstNonStaticT == si.fields.len) return GetDirectMergedT(context);
   if (si.layout == .@"packed") @compileError("Packed structs with dynamic data are not supported");
   return Retval;
 }
 
-pub fn GetOptionalMergedT(T: type, context: Context) type {
+pub fn GetOptionalMergedT(context: Context) type {
+  const T = context.options.T;
   const oi = @typeInfo(T).optional;
-  if (@typeInfo(oi.child) == .pointer) return GetOnePointerMergedT(T, context);
+  if (@typeInfo(oi.child) == .pointer) return GetOnePointerMergedT(context);
 
-  const Child = ToMergedT(oi.child, context);
-  if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(T, context);
-  const Tag = ToMergedT(bool, context);
+  const Child = ToMergedT(context.T(oi.child));
+  if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(context);
+  const Tag = ToMergedT(context.T(bool));
 
   const alignment = context.align_hint orelse .fromByteUnits(@alignOf(T));
   return opaque {
@@ -476,15 +489,16 @@ pub fn GetOptionalMergedT(T: type, context: Context) type {
   };
 }
 
-pub fn GetErrorUnionMergedT(T: type, context: Context) type {
+pub fn GetErrorUnionMergedT(context: Context) type {
+  const T = context.options.T;
   const ei = @typeInfo(T).error_union;
   const Payload = ei.payload;
   const ErrorSet = ei.error_set;
   const ErrorInt = std.meta.Int(.unsigned, @bitSizeOf(ErrorSet));
 
-  const Child = ToMergedT(Payload, context);
-  if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(T, context);
-  const Err = ToMergedT(ErrorInt, context);
+  const Child = ToMergedT(context.T(Payload));
+  if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(context);
+  const Err = ToMergedT(context.T(ErrorInt));
 
   const ErrSize = Err.Signature.static_size;
   const PayloadSize = Child.Signature.static_size;
@@ -531,8 +545,9 @@ pub fn GetErrorUnionMergedT(T: type, context: Context) type {
   };
 }
 
-pub fn GetUnionMergedT(T: type, context: Context) type {
-  if (!context.options.recurse) return GetDirectMergedT(T, context);
+pub fn GetUnionMergedT(context: Context) type {
+  const T = context.options.T;
+  if (!context.options.recurse) return GetDirectMergedT(context);
 
   const ui = @typeInfo(T).@"union";
   if (ui.tag_type == null) {
@@ -555,13 +570,13 @@ pub fn GetUnionMergedT(T: type, context: Context) type {
         }
         pfields[i] = .{
           .original = f,
-          .merged = ToMergedT(f.type, next_context.realign(.fromByteUnits(f.alignment))),
+          .merged = ToMergedT(next_context.realign(.fromByteUnits(f.alignment)).T(f.type)),
         };
       }
       break :blk pfields;
     };
 
-    const Tag = ToMergedT(ui.tag_type.?, context.realign(null));
+    const Tag = ToMergedT(context.realign(null).T(ui.tag_type.?));
     const max_child_static_size = blk: {
       var max_size: usize = 0;
       for (fields) |f| max_size = @max(max_size, f.merged.Signature.static_size);
@@ -638,31 +653,32 @@ pub fn GetUnionMergedT(T: type, context: Context) type {
       }
     }
     break :blk true;
-  }) return GetDirectMergedT(T, context);
+  }) return GetDirectMergedT(context);
 
   return Retval;
 }
 
-pub fn ToMergedT(T: type, context: Context) type {
+pub fn ToMergedT(context: Context) type {
+  const T = context.options.T;
   @setEvalBranchQuota(1000_000);
   return switch (@typeInfo(T)) {
     .type, .noreturn, .comptime_int, .comptime_float, .undefined, .@"fn", .frame, .@"anyframe", .enum_literal => {
       @compileError("Type '" ++ @tagName(std.meta.activeTag(@typeInfo(T))) ++ "' is not mergeable\n");
     },
-    .void, .bool, .int, .float, .vector, .error_set, .null => GetDirectMergedT(T, context),
+    .void, .bool, .int, .float, .vector, .error_set, .null => GetDirectMergedT(context),
     .pointer => |pi| switch (pi.size) {
-      .many, .c => if (context.options.serialize_unknown_pointer_as_usize) GetDirectMergedT(T, context) else {
+      .many, .c => if (context.options.serialize_unknown_pointer_as_usize) GetDirectMergedT(context) else {
         @compileError(@tagName(pi.size) ++ " pointer cannot be serialized for type " ++ @typeName(T) ++ ", consider setting serialize_many_pointer_as_usize to true\n");
       },
-      .one => GetOnePointerMergedT(T, context),
-      .slice => GetSliceMergedT(T, context),
+      .one => GetOnePointerMergedT(context),
+      .slice => GetSliceMergedT(context),
     },
-    .array => GetArrayMergedT(T, context),
-    .@"struct" => GetStructMergedT(T, context),
-    .optional => GetOptionalMergedT(T, context),
-    .error_union => GetErrorUnionMergedT(T, context),
-    .@"enum" => GetDirectMergedT(T, context),
-    .@"union" => GetUnionMergedT(T, context),
+    .array => GetArrayMergedT(context),
+    .@"struct" => GetStructMergedT(context),
+    .optional => GetOptionalMergedT(context),
+    .error_union => GetErrorUnionMergedT(context),
+    .@"enum" => GetDirectMergedT(context),
+    .@"union" => GetUnionMergedT(context),
     .@"opaque" => if (@hasDecl(T, "Signature") and @hasField(T.Signature, "T") and @FieldType(T.Signature, "T") == type) T else {
       @compileError("A non-mergeable opaque " ++ @typeName(T) ++ " was provided to `ToMergedT`\n");
     },
@@ -670,15 +686,14 @@ pub fn ToMergedT(T: type, context: Context) type {
 }
 
 // ========================================
-//                 Testing
+//                 Testing                 
 // ========================================
 
 const testing = std.testing;
 const expectEqual = @import("testing.zig").expectEqual;
 
 fn _testMergingDemerging(value: anytype, comptime options: ToMergedOptions) !void {
-  const T = @TypeOf(value);
-  const MergedT = ToMergedT(T, .init(options));
+  const MergedT = ToMergedT(.init(options));
 
   const static_size = MergedT.Signature.static_size;
   var static_buffer: [static_size]u8 = undefined;
@@ -1245,5 +1260,111 @@ test "deeply nested, mutually recursive structures with no data cycles" {
   };
 
   try _testMergingDemerging(root_node, .{ .T = MegaStructureA, .allow_recursive_rereferencing = true });
+}
+
+// ========================================
+//                 Wrapper                 
+// ========================================
+
+/// A generic wrapper that manages the memory for a merged object.
+pub fn Wrapper(options: ToMergedOptions) type {
+  return struct {
+    pub const MergedT = ToMergedT(.init(options));
+    memory: []align(MergedT.Signature.alignment.toByteUnits()) u8,
+
+    /// Returns the total size that would be required to store this value
+    /// Expects there to be no data cycles
+    pub fn getSize(value: *const options.T) usize {
+      const static_size = MergedT.Signature.static_size;
+      return if (@hasDecl(MergedT, "getDynamicSize")) MergedT.getDynamicSize(&value, static_size) else static_size;
+    }
+
+    /// Allocates memory and merges the initial value into a self-managed buffer.
+    /// The Wrapper instance owns the memory and must be de-initialized with `deinit`.
+    /// Expects there to be no data cycles
+    pub fn init(allocator: std.mem.Allocator, value: *const options.T) !@This() {
+      const memory = try allocator.alignedAlloc(u8, MergedT.Signature.alignment.toByteUnits(), getSize(value));
+
+      const dynamic_buffer = MergedT.Signature.D.init(memory[MergedT.Signature.static_size..]).alignForward(.fromByteUnits(MergedT.Signature.D.alignment));
+      _ = MergedT.write(value, .initAssert(memory[0..MergedT.Signature.static_size]), dynamic_buffer);
+
+      return .{ .memory = memory };
+    }
+
+    /// Frees the memory owned by the Wrapper.
+    pub fn deinit(self: *const @This(), allocator: std.mem.Allocator) void {
+      allocator.free(self.memory);
+    }
+
+    /// Returns a mutable pointer to the merged data, allowing modification.
+    /// The pointer is valid as long as the Wrapper is not de-initialized.
+    pub fn get(self: *const @This()) *options.T {
+      return @as(*options.T, @alignCast(@ptrCast(self.memory.ptr)));
+    }
+
+    /// Creates a new, independent Wrapper containing a deep copy of the data.
+    pub fn clone(self: *const @This(), allocator: std.mem.Allocator) !@This() {
+      return try @This().init(allocator, self.get());
+    }
+
+    /// Set a new value into the wrapper. Invalidates any references to the old value
+    /// Expects there to be no data cycles
+    pub fn set(self: *@This(), allocator: std.mem.Allocator, value: *const options.T) !void {
+      const memory = try allocator.realloc(u8, self.memory, getSize(value));
+
+      const dynamic_buffer = MergedT.Signature.D.init(memory[MergedT.Signature.static_size..]).alignForward(.fromByteUnits(MergedT.Signature.D.alignment));
+      _ = MergedT.write(value, .initAssert(memory[0..MergedT.Signature.static_size]), dynamic_buffer);
+
+      return .{ .memory = memory };
+    }
+
+    /// Set a new value into the wrapper, asserting that underlying allocation can hold it. Invalidates any references to the old value
+    /// Expects there to be no data cycles
+    pub fn setAssert(self: *@This(), value: *const options.T) !void {
+      if (builtin.mode == .Debug) { // debug.assert alone may does not be optimized out
+        std.debug.assert(getSize(value) < self.memory.len);
+      }
+      const dynamic_buffer = MergedT.Signature.D.init(self.memory[MergedT.Signature.static_size..]).alignForward(.fromByteUnits(MergedT.Signature.D.alignment));
+      _ = MergedT.write(value, .initAssert(self.memory[0..MergedT.Signature.static_size]), dynamic_buffer);
+    }
+  };
+}
+
+
+// ========================================
+//            Wrapper Tests
+// ========================================
+
+test "Wrapper init, get, and deinit" {
+  const Point = struct { x: i32, y: []const u8 };
+  var wrapped_point = try Wrapper(.{ .T = Point }).init(testing.allocator, &.{ .x = 42, .y = "hello" });
+  defer wrapped_point.deinit(testing.allocator);
+
+  const p = wrapped_point.get();
+  try expectEqual(@as(i32, 42), p.x);
+  try std.testing.expectEqualSlices(u8, "hello", p.y);
+}
+
+test "Wrapper clone" {
+  const Data = struct { id: u32, items: []const u32 };
+  var wrapped1 = try Wrapper(.{ .T = Data }).init(testing.allocator, &.{ .id = 1, .items = &.{ 10, 20, 30 } });
+  defer wrapped1.deinit(testing.allocator);
+
+  var wrapped2 = try wrapped1.clone(testing.allocator);
+  defer wrapped2.deinit(testing.allocator);
+
+  // Ensure they are not the same memory block
+  try testing.expect(wrapped1.memory.ptr != wrapped2.memory.ptr);
+
+  // Ensure the content is identical
+  const d1 = wrapped1.get();
+  const d2 = wrapped2.get();
+  try expectEqual(d1.id, d2.id);
+  try std.testing.expectEqualSlices(u32, d1.items, d2.items);
+
+  // Modify the original and ensure the clone is unaffected
+  wrapped1.get().id = 99;
+  try expectEqual(@as(u32, 99), wrapped1.get().id);
+  try expectEqual(@as(u32, 1), wrapped2.get().id);
 }
 
