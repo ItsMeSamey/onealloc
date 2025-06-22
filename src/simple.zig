@@ -231,17 +231,18 @@ pub fn GetOnePointerMergedT(T: type, context: Context) type {
       .alignment = context.align_hint orelse .fromByteUnits(@alignOf(T)),
     };
 
-    pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
+    pub fn write(val: *const T, static: S, _dynamic: Signature.D) usize {
       std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Pointer.Signature.alignment.toByteUnits()));
-      std.debug.assert(std.mem.isAligned(@intFromPtr(dynamic.ptr), Signature.D.alignment));
+      std.debug.assert(std.mem.isAligned(@intFromPtr(_dynamic.ptr), Signature.D.alignment));
 
       // TODO: Add a function to fix portability issues with pointers
       if (is_optional and val.* == null) return Pointer.write(&@as(T, null), static, undefined);
 
-      const dptr: T = @ptrFromInt(@intFromPtr(dynamic.ptr));
+      const dptr: T = @ptrFromInt(@intFromPtr(_dynamic.ptr));
       std.debug.assert(0 == Pointer.write(&dptr, static, undefined));
 
-      const child_static = dynamic.till(Child.Signature.static_size);
+      const dynamic = if (is_optional) _dynamic.alignForward(Child.Signature.alignment) else _dynamic;
+      const child_static =  dynamic.till(Child.Signature.static_size);
       const child_dynamic = dynamic.from(Child.Signature.static_size).alignForward(.fromByteUnits(Child.Signature.D.alignment));
       const written = Child.write(if (is_optional) val.*.? else val.*, child_static, child_dynamic);
 
@@ -925,5 +926,21 @@ test "enums" {
   // Simple
   const Color = enum { red, green, blue };
   try testSerialization(Color.green);
+}
+
+test "optional" {
+  // value
+  var x: ?i32 = 42;
+  try testSerialization(x);
+  x = null;
+  try testSerialization(x);
+
+  // pointer
+  var y: i32 = 123;
+  var opt_ptr: ?*i32 = &y;
+  try testSerialization(opt_ptr);
+
+  opt_ptr = null;
+  try testSerialization(opt_ptr);
 }
 
