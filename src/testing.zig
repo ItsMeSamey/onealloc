@@ -25,7 +25,11 @@ pub fn expectEqual(expected: anytype, actual: anytype) error{TestExpectedEqual}!
     .pointer => |pointer| {
       switch (pointer.size) {
         .one, .many, .c => {
-          if (actual == expected) return;
+          if (actual == expected) {
+            // std.debug.dumpCurrentStackTrace(null);
+            // std.debug.print("pointers are same for {s}\n", .{ @typeName(@TypeOf(actual)) });
+            return;
+          }
           return expectEqual(actual.*, expected.*);
         },
         .slice => {
@@ -33,7 +37,11 @@ pub fn expectEqual(expected: anytype, actual: anytype) error{TestExpectedEqual}!
             print("expected slice len {}, found {}\n", .{ expected.len, actual.len });
             return error.TestExpectedEqual;
           }
-          if (actual.ptr == expected.ptr) return;
+          if (actual.ptr == expected.ptr) {
+            // std.debug.dumpCurrentStackTrace(null);
+            // std.debug.print("slices are same for {s}\n", .{ @typeName(@TypeOf(actual)) });
+            return;
+          }
           for (actual, expected, 0..) |va, ve, i| {
             expectEqual(va, ve) catch |e| {
               print("index {d} incorrect. expected {any}, found {any}\n", .{ i, expected[i], actual[i] });

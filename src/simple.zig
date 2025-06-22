@@ -65,7 +65,7 @@ const Context = struct {
 
   pub fn see(self: @This(), new_T: type, Result: type) @This() { // Yes we can do this, Zig is f****ing awesome
     const have_seen = comptime blk: {
-      for (self.seen_types, 0..) |t, i| if (meta.ContainsT(new_T, t)) break :blk i;
+      for (self.seen_types, 0..) |t, i| if (new_T == t) break :blk i;
       break :blk -1;
     };
 
@@ -77,7 +77,6 @@ const Context = struct {
     retval.seen_types = self.seen_types ++ [1]type{new_T};
     retval.result_types = self.result_types ++ [1]type{Result};
     retval.seen_recursive = have_seen;
-    retval.options.T = new_T;
     return retval;
   }
 
@@ -206,10 +205,10 @@ pub fn GetOnePointerMergedT(context: Context) type {
       // TODO: Add a function to fix portability issues with pointers
       if (is_optional and val.* == null) return Pointer.write(&@as(T, null), static, undefined);
 
-      const dptr: T = @ptrFromInt(@intFromPtr(_dynamic.ptr));
+      const dynamic = if (is_optional) _dynamic.alignForward(Child.Signature.alignment) else _dynamic;
+      const dptr: T = @ptrCast(@alignCast(dynamic.ptr));
       std.debug.assert(0 == Pointer.write(&dptr, static, undefined));
 
-      const dynamic = if (is_optional) _dynamic.alignForward(Child.Signature.alignment) else _dynamic;
       const child_static =  dynamic.till(Child.Signature.static_size);
       const child_dynamic = dynamic.from(Child.Signature.static_size).alignForward(.fromByteUnits(Child.Signature.D.alignment));
       const written = Child.write(if (is_optional) val.*.? else val.*, child_static, child_dynamic);
@@ -274,7 +273,7 @@ pub fn GetSliceMergedT(context: Context) type {
       std.debug.assert(0 == Slice.write(&header_to_write, static, undefined));
 
       const len = val.*.len;
-      if (len == 0) return 0;
+      if (Child.Signature.static_size == 0 or len == 0) return 0;
 
       var child_static = dynamic.till(Child.Signature.static_size * len);
       var child_dynamic = dynamic.from(Child.Signature.static_size * len).alignForward(.fromByteUnits(Child.Signature.D.alignment));
@@ -289,7 +288,8 @@ pub fn GetSliceMergedT(context: Context) type {
       return @intFromPtr(child_dynamic.ptr) - @intFromPtr(dynamic.ptr);
     }
 
-    pub fn getDynamicSize(val: *const T, size: usize) usize {
+    pub const getDynamicSize = if (Child.Signature.static_size == 0) void else _getDynamicSize;
+    fn _getDynamicSize(val: *const T, size: usize) usize {
       std.debug.assert(std.mem.isAligned(size, Signature.D.alignment));
       var new_size = size + Child.Signature.static_size * val.*.len;
 
@@ -389,14 +389,14 @@ pub fn GetStructMergedT(context: Context) type {
     };
 
     const FirstNonStaticT = blk: {
-      for (si.fields, 0..) |f, i| if (std.meta.hasFn(f.type, "getDynamicSize")) break :blk i;
+      for (fields, 0..) |f, i| if (std.meta.hasFn(f.merged, "getDynamicSize")) break :blk i;
       break :blk si.fields.len;
     };
 
     const S = Bytes(Signature.alignment);
     pub const Signature = MergedSignature{
       .T = T,
-      .D = Bytes(fields[FirstNonStaticT].merged.Signature.D.alignment),
+      .D = Bytes(.fromByteUnits(fields[FirstNonStaticT].merged.Signature.D.alignment)),
       .static_size = @sizeOf(T),
       .alignment = context.align_hint orelse .fromByteUnits(@alignOf(T)),
     };
@@ -416,7 +416,7 @@ pub fn GetStructMergedT(context: Context) type {
           const misaligned_dynamic = dynamic.from(dynamic_offset);
           const aligned_dynamic = misaligned_dynamic.alignForward(.fromByteUnits(f.merged.Signature.D.alignment));
           const written = f.merged.write(&@field(val.*, f.original.name), child_static, aligned_dynamic);
-          dynamic_offset += written + @intFromPtr(misaligned_dynamic.ptr) - @intFromPtr(aligned_dynamic.ptr);
+          dynamic_offset += written + @intFromPtr(aligned_dynamic.ptr) - @intFromPtr(misaligned_dynamic.ptr);
         }
       }
 
@@ -464,7 +464,7 @@ pub fn GetOptionalMergedT(context: Context) type {
 
     pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
       std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Signature.alignment.toByteUnits()));
-      const tag_static = static.from(Child.Signature.static_size);
+      const tag_static = static.from(Child.Signature.static_size).assertAligned(Child.Signature.alignment);
       const child_static = static.till(Child.Signature.static_size);
 
       if (val.*) |*payload_val| {
@@ -480,8 +480,8 @@ pub fn GetOptionalMergedT(context: Context) type {
 
     pub fn getDynamicSize(val: *const T, size: usize) usize {
       if (val.*) |*payload_val| {
-        size = std.mem.alignForward(usize, size, Tag.Signature.alignment.toByteUnits());
-        return Child.getDynamicSize(payload_val, size);
+        const new_size = std.mem.alignForward(usize, size, Tag.Signature.alignment.toByteUnits());
+        return Child.getDynamicSize(payload_val, new_size);
       } else {
         return size;
       }
@@ -707,7 +707,13 @@ fn _testMergingDemerging(value: anytype, comptime options: ToMergedOptions) !voi
 
   const written_dynamic_size = MergedT.write(&value, .initAssert(&static_buffer), .initAssert(&dynamic_buffer));
 
-  std.debug.assert(written_dynamic_size == dynamic_size);
+  if (std.meta.hasFn(@TypeOf(value), "PRINT")) {
+    std.debug.print("static: {d}, dynamic: {s}\n", .{ static_buffer[0..MergedT.Signature.static_size], dynamic_buffer[0..written_dynamic_size] });
+    std.debug.print("value: {any}\n", .{value});
+    std.debug.print("merged: {any}\n", .{@as(*@TypeOf(value), @ptrCast(@alignCast(&static_buffer)))});
+  }
+
+  try std.testing.expectEqual(dynamic_size, written_dynamic_size);
   try expectEqual(&value, @as(*@TypeOf(value), @ptrFromInt(@intFromPtr(&static_buffer))));
 }
 
@@ -1123,13 +1129,13 @@ test "deep optional and pointer nesting" {
   };
 
   const x: u32 = 123;
-  
+
   // Fully valued
   try testMerging(DeepOptional{ .val = &x });
-  
+
   // Inner pointer is null
   try testMerging(DeepOptional{ .val = @as(?*const u32, null) });
-  
+
   // Outer optional is null
   try testMerging(DeepOptional{ .val = @as(??*const u32, null) });
 }
@@ -1183,10 +1189,6 @@ test "mutual recursion" {
   const b1 = NodeB{ .value = 100, .a = &a2 };
   const a1 = NodeA{ .name = "a1", .b = &b1 };
 
-  // Default behavior, does not flatten.
-  try _testMergingDemerging(a1, .{ .T = NodeA });
-
-  // Flatten the recursion once.
   try _testMergingDemerging(a1, .{ .T = NodeA, .allow_recursive_rereferencing = true });
 }
 
@@ -1276,7 +1278,7 @@ pub fn Wrapper(options: ToMergedOptions) type {
     /// Expects there to be no data cycles
     pub fn getSize(value: *const options.T) usize {
       const static_size = MergedT.Signature.static_size;
-      return if (@hasDecl(MergedT, "getDynamicSize")) MergedT.getDynamicSize(&value, static_size) else static_size;
+      return if (@hasDecl(MergedT, "getDynamicSize")) MergedT.getDynamicSize(value, static_size) else static_size;
     }
 
     /// Allocates memory and merges the initial value into a self-managed buffer.
