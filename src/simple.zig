@@ -840,7 +840,7 @@ fn expectEqual(expected: anytype, actual: anytype) !void {
   }
 }
 
-fn _testSerializationDeserialization(value: anytype, comptime options: ToMergedOptions) !void {
+fn _testMergingDemerging(value: anytype, comptime options: ToMergedOptions) !void {
   const T = @TypeOf(value);
   const MergedT = ToMergedT(T, .{
     .align_hint = null,
@@ -865,93 +865,93 @@ fn _testSerializationDeserialization(value: anytype, comptime options: ToMergedO
   try expectEqual(&value, @as(*@TypeOf(value), @ptrFromInt(@intFromPtr(&static_buffer))));
 }
 
-fn testSerialization(value: anytype) !void {
-  try _testSerializationDeserialization(value, .{ .T = @TypeOf(value) });
+fn testMerging(value: anytype) !void {
+  try _testMergingDemerging(value, .{ .T = @TypeOf(value) });
 }
 
 test "primitives" {
-  try testSerialization(@as(u32, 42));
-  try testSerialization(@as(f64, 123.456));
-  try testSerialization(@as(bool, true));
-  try testSerialization(@as(void, {}));
+  try testMerging(@as(u32, 42));
+  try testMerging(@as(f64, 123.456));
+  try testMerging(@as(bool, true));
+  try testMerging(@as(void, {}));
 }
 
 test "pointers" {
   var x: u64 = 12345;
-  try testSerialization(&x);
-  try _testSerializationDeserialization(&x, .{ .T = *u64, .dereference = 0, .error_on_0_dereference = false });
+  try testMerging(&x);
+  try _testMergingDemerging(&x, .{ .T = *u64, .dereference = 0, .error_on_0_dereference = false });
 }
 
 test "slices" {
   // primitive
-  try testSerialization(@as([]const u8, "hello zig"));
+  try testMerging(@as([]const u8, "hello zig"));
 
   // struct
   const Point = struct { x: u8, y: u8 };
-  try testSerialization(@as([]const Point, &.{ .{ .x = 1, .y = 2 }, .{ .x = 3, .y = 4 } }));
+  try testMerging(@as([]const Point, &.{ .{ .x = 1, .y = 2 }, .{ .x = 3, .y = 4 } }));
 
   // nested
-  try testSerialization(@as([]const []const u8, &.{"hello", "world", "zig", "rocks"}));
+  try testMerging(@as([]const []const u8, &.{"hello", "world", "zig", "rocks"}));
 
   // empty
-  try testSerialization(@as([]const u8, &.{}));
-  try testSerialization(@as([]const []const u8, &.{}));
-  try testSerialization(@as([]const []const u8, &.{"", "a", ""}));
+  try testMerging(@as([]const u8, &.{}));
+  try testMerging(@as([]const []const u8, &.{}));
+  try testMerging(@as([]const []const u8, &.{"", "a", ""}));
 }
 
 test "arrays" {
   // primitive
-  try testSerialization([4]u8{ 1, 2, 3, 4 });
+  try testMerging([4]u8{ 1, 2, 3, 4 });
 
   // struct array
   const Point = struct { x: u8, y: u8 };
-  try testSerialization([2]Point{ .{ .x = 1, .y = 2 }, .{ .x = 3, .y = 4 } });
+  try testMerging([2]Point{ .{ .x = 1, .y = 2 }, .{ .x = 3, .y = 4 } });
 
   // nested arrays
-  try testSerialization([2][2]u8{ .{ 1, 2 }, .{ 3, 4 } });
+  try testMerging([2][2]u8{ .{ 1, 2 }, .{ 3, 4 } });
 
   // empty
-  try testSerialization([0]u8{});
+  try testMerging([0]u8{});
 }
 
 test "structs" {
   // Simple
   const Point = struct { x: i32, y: i32 };
-  try testSerialization(Point{ .x = -10, .y = 20 });
+  try testMerging(Point{ .x = -10, .y = 20 });
 
   // Nested
   const Line = struct { p1: Point, p2: Point };
-  try testSerialization(Line{ .p1 = .{ .x = 1, .y = 2 }, .p2 = .{ .x = 3, .y = 4 } });
+  try testMerging(Line{ .p1 = .{ .x = 1, .y = 2 }, .p2 = .{ .x = 3, .y = 4 } });
 }
 
 test "enums" {
   // Simple
   const Color = enum { red, green, blue };
-  try testSerialization(Color.green);
+  try testMerging(Color.green);
 }
 
 test "optional" {
   // value
   var x: ?i32 = 42;
-  try testSerialization(x);
+  try testMerging(x);
   x = null;
-  try testSerialization(x);
+  try testMerging(x);
 
   // pointer
   var y: i32 = 123;
   var opt_ptr: ?*i32 = &y;
-  try testSerialization(opt_ptr);
+  try testMerging(opt_ptr);
 
   opt_ptr = null;
-  try testSerialization(opt_ptr);
+  try testMerging(opt_ptr);
 }
 
 test "error_unions" {
   const MyError = error{Oops};
   var eu: MyError!u32 = 123;
-  try testSerialization(eu);
+  try testMerging(eu);
   eu = MyError.Oops;
-  try testSerialization(eu);
+  try testMerging(eu);
 }
 
 test "unions" {
@@ -960,9 +960,9 @@ test "unions" {
     b: bool,
     c: void,
   };
-  try testSerialization(Payload{ .a = 99 });
-  try testSerialization(Payload{ .b = false });
-  try testSerialization(Payload{ .c = {} });
+  try testMerging(Payload{ .a = 99 });
+  try testMerging(Payload{ .b = false });
+  try testMerging(Payload{ .c = {} });
 }
 
 test "complex struct" {
@@ -987,13 +987,13 @@ test "complex struct" {
     .e = 3.14,
   };
 
-  try testSerialization(value);
+  try testMerging(value);
 
   value.b = "";
-  try testSerialization(value);
+  try testMerging(value);
 
   value.d = null;
-  try testSerialization(value);
+  try testMerging(value);
 }
 
 test "slice of complex structs" {
@@ -1009,7 +1009,7 @@ test "slice of complex structs" {
     .{ .id = 3, .name = "", .is_active = true },
   };
 
-  try testSerialization(items[0..]);
+  try testMerging(items[0..]);
 }
 
 test "complex composition" {
@@ -1045,7 +1045,7 @@ test "complex composition" {
     },
   };
 
-  try testSerialization(value);
+  try testMerging(value);
 }
 
 test "multiple dynamic fields" {
@@ -1060,23 +1060,23 @@ test "multiple dynamic fields" {
     .b = 12345,
     .c = "world",
   };
-  try testSerialization(value);
+  try testMerging(value);
 
   value.a = "";
-  try testSerialization(value);
+  try testMerging(value);
 }
 
 test "complex array" {
-  const ReorderStruct = struct {
+  const Struct = struct {
     a: u8,
-    b: u32, // Will be reordered with 'a'
+    b: u32,
   };
-  const value = [2]ReorderStruct{
+  const value = [2]Struct{
     .{ .a = 1, .b = 100 },
     .{ .a = 2, .b = 200 },
   };
 
-  try testSerialization(value);
+  try testMerging(value);
 }
 
 test "packed struct with mixed alignment fields" {
@@ -1094,7 +1094,7 @@ test "packed struct with mixed alignment fields" {
     .d = true,
   };
 
-  try testSerialization(value);
+  try testMerging(value);
 }
 
 test "struct with zero-sized fields" {
@@ -1105,7 +1105,7 @@ test "struct with zero-sized fields" {
     d: []const u8,
     e: bool,
   };
-  try testSerialization(ZST_1{
+  try testMerging(ZST_1{
     .a = 123,
     .b = {},
     .c = .{},
@@ -1134,10 +1134,10 @@ test "struct with zero-sized fields" {
     .e = true,
   };
 
-  try testSerialization(value_2);
+  try testMerging(value_2);
 
   value_2.zst_union = .{ .d = 999 };
-  try testSerialization(value_2);
+  try testMerging(value_2);
 }
 
 test "array of unions with dynamic fields" {
@@ -1153,7 +1153,7 @@ test "array of unions with dynamic fields" {
     .{ .text = "world" },
   };
 
-  try testSerialization(messages);
+  try testMerging(messages);
 }
 
 test "pointer and optional abuse" {
@@ -1176,10 +1176,134 @@ test "pointer and optional abuse" {
     .d = &.{ &p2, null, &p3 },
   };
 
-  try testSerialization(value);
+  try testMerging(value);
 }
 
-// test "recursive type serialization" {
+test "deeply nested struct with one dynamic field at the end" {
+  const Level4 = struct {
+    data: []const u8,
+  };
+  const Level3 = struct {
+    l4: Level4,
+  };
+  const Level2 = struct {
+    l3: Level3,
+    val: u64,
+  };
+  const Level1 = struct {
+    l2: Level2,
+  };
+
+  const value = Level1{
+    .l2 = .{
+      .l3 = .{
+        .l4 = .{
+          .data = "we need to go deeper",
+        },
+      },
+      .val = 99,
+    },
+  };
+  try testMerging(value);
+}
+
+
+test "slice of structs with dynamic fields" {
+  const LogEntry = struct {
+    timestamp: u64,
+    message: []const u8,
+  };
+  const entries = [_]LogEntry{
+    .{ .timestamp = 1, .message = "first entry" },
+    .{ .timestamp = 2, .message = "" },
+    .{ .timestamp = 3, .message = "third entry has a much longer message to test buffer allocation" },
+  };
+
+  try testMerging(entries[0..]);
+}
+
+test "struct with multiple, non-contiguous dynamic fields" {
+  const UserProfile = struct {
+    username: []const u8,
+    user_id: u64,
+    bio: []const u8,
+    karma: i32,
+    avatar_url: []const u8,
+  };
+
+  const user = UserProfile{
+    .username = "zigger",
+    .user_id = 1234,
+    .bio = "Loves comptime and robust software.",
+    .karma = 9999,
+    .avatar_url = "http://ziglang.org/logo.svg",
+  };
+
+  try testMerging(user);
+}
+
+
+test "union with multiple dynamic fields" {
+  const Packet = union(enum) {
+    message: []const u8,
+    points: []const struct { x: f32, y: f32 },
+    code: u32,
+  };
+
+  try testMerging(Packet{ .message = "hello world" });
+  try testMerging(Packet{ .points = &.{.{ .x = 1.0, .y = 2.0 }, .{ .x = 3.0, .y = 4.0}} });
+  try testMerging(Packet{ .code = 404 });
+}
+
+test "advanced zero-sized type handling" {
+  const ZstContainer = struct {
+    zst1: void,
+    zst2: [0]u8,
+    data: []const u8, // This is the only thing that should take space
+  };
+  try testMerging(ZstContainer{ .zst1 = {}, .zst2 = .{}, .data = "hello" });
+
+  const ZstSliceContainer = struct {
+    id: u32,
+    zst_slice: []const void,
+  };
+
+  try testMerging(ZstSliceContainer{ .id = 99, .zst_slice = &.{ {}, {}, {} } });
+}
+
+test "deep optional and pointer nesting" {
+  const DeepOptional = struct {
+    val: ??*const u32,
+  };
+
+  const x: u32 = 123;
+  
+  // Fully valued
+  try testMerging(DeepOptional{ .val = &x });
+  
+  // Inner pointer is null
+  try testMerging(DeepOptional{ .val = @as(?*const u32, null) });
+  
+  // Outer optional is null
+  try testMerging(DeepOptional{ .val = @as(??*const u32, null) });
+}
+
+// test "recursion limit with dereference" {
+//   const Node = struct {
+//     payload: u32,
+//     next: ?*const @This(),
+//   };
+//
+//   const n3 = Node{ .payload = 3, .next = null };
+//   const n2 = Node{ .payload = 2, .next = &n3 };
+//   const n1 = Node{ .payload = 1, .next = &n2 };
+//
+//   // This should only serialize n1 and the pointer to n2. 
+//   // The `write` for n2 will hit the dereference limit and treat it as a direct (raw pointer) value.
+//   try _testMergingDemerging(n1, .{ .T = Node, .dereference = 1 });
+// }
+//
+// test "recursive type merging" {
 //   const Node = struct {
 //     payload: u32,
 //     next: ?*const @This(),
@@ -1190,6 +1314,33 @@ test "pointer and optional abuse" {
 //   const n2 = Node{ .payload = 2, .next = &n3 };
 //   const n1 = Node{ .payload = 1, .next = &n2 };
 //
-//   try _testSerializationDeserialization(n1, .{ .T = Node, .flatten_self_references = 4 });
+//   try _testMergingDemerging(n1, .{ .T = Node, .flatten_self_references = 4 });
+// }
+//
+// test "mutual recursion with flatten_self_references" {
+//   const Namespace = struct {
+//     const NodeA = struct {
+//       name: []const u8,
+//       b: ?*const NodeB,
+//     };
+//     const NodeB = struct {
+//       value: u32,
+//       a: ?*const NodeA,
+//     };
+//   };
+//
+//   const NodeA = Namespace.NodeA;
+//   const NodeB = Namespace.NodeB;
+//
+//   // Create a linked list: a1 -> b1 -> a2 -> null
+//   const a2 = NodeA{ .name = "a2", .b = null };
+//   const b1 = NodeB{ .value = 100, .a = &a2 };
+//   const a1 = NodeA{ .name = "a1", .b = &b1 };
+//
+//   // Default behavior, does not flatten.
+//   try _testMergingDemerging(a1, .{ .T = NodeA });
+//
+//   // Flatten the recursion once.
+//   try _testMergingDemerging(a1, .{ .T = NodeA, .flatten_self_references = 1, .recursive_rereferencing = .top_only });
 // }
 
