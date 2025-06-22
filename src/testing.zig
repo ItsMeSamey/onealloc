@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn expectEqual(expected: anytype, actual: anytype) !void {
+pub fn expectEqual(expected: anytype, actual: anytype) error{TestExpectedEqual}!void {
   const print = std.debug.print;
 
   switch (@typeInfo(@TypeOf(actual))) {

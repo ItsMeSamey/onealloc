@@ -43,55 +43,47 @@ pub const MergedSignature = struct {
 const Context = struct {
   align_hint: ?std.mem.Alignment,
   seen_types: []const type,
+  result_types: []const type,
   options: ToMergedOptions,
-  comptime seen_recursive: bool = true,
+  seen_recursive: comptime_int,
 
-  pub fn realign(self: @This(), align_hint: ?std.mem.Alignment) @This() {
+  pub fn init(options: ToMergedOptions) @This() {
     return .{
-      .align_hint = align_hint,
-      .seen_types = self.seen_types,
-      .options = self.options,
-      .seen_recursive = self.seen_recursive,
+      .align_hint = null,
+      .seen_types = &.{},
+      .result_types = &.{},
+      .options = options,
+      .seen_recursive = -1,
     };
   }
 
-  pub fn see(self: @This(), T: type) @This() {
-    if (self.seen_recursive or self.options.allow_recursive_rereferencing) return self;
+  pub fn realign(self: @This(), align_hint: ?std.mem.Alignment) @This() {
+    var retval = self;
+    retval.align_hint = align_hint;
+    return retval;
+  }
 
+  pub fn see(self: @This(), T: type, Result: type) @This() { // Yes we can do this, Zig is f****ing awesome
     const have_seen = comptime blk: {
-      if (self.seen_types.len == 0) break :blk false;
-      for (self.seen_types) |t| if (meta.ContainsT(T, t)) break :blk true;
-      break :blk false;
+      for (self.seen_types, 0..) |t, i| if (meta.ContainsT(T, t)) break :blk i;
+      break :blk -1;
     };
 
-    if (!have_seen) return .{
-      .align_hint = self.align_hint,
-      .seen_types = self.seen_types ++ [1]type{T},
-      .options = self.options,
-      .seen_recursive = self.seen_recursive,
-    };
-
-    if (!self.options.allow_recursive_rereferencing) {
-      @compileError(@typeName(self.seen_types[0]) ++ " contains a self referential type " ++ @typeName(T) ++ " within itself");
+    if (have_seen != -1 and !self.options.allow_recursive_rereferencing) {
+      @compileError("Recursive type " ++ @typeName(T) ++ " is not allowed to be referenced by another type");
     }
 
-    unreachable;
-
-    // return .{
-    //   .align_hint = self.align_hint,
-    //   .seen_types = self.seen_types,
-    //   .options = self.options,
-    //   .seen_recursive = true,
-    // };
+    var retval = self;
+    retval.seen_types = self.seen_types ++ [1]type{T};
+    retval.result_types = self.result_types ++ [1]type{Result};
+    retval.seen_recursive = have_seen;
+    return retval;
   }
 
   pub fn reop(self: @This(), options: ToMergedOptions) @This() {
-    return .{
-      .align_hint = self.align_hint,
-      .seen_types = self.seen_types,
-      .options = options,
-      .seen_recursive = self.seen_recursive,
-    };
+    var retval = self;
+    retval.options = options;
+    return retval;
   }
 };
 
@@ -184,12 +176,12 @@ pub fn GetOnePointerMergedT(T: type, context: Context) type {
   const pi = @typeInfo(if (is_optional) @typeInfo(T).optional.child else T).pointer;
   std.debug.assert(pi.size == .one);
 
-  const next_context = context.see(T);
-
   const Pointer = GetDirectMergedT(T, context);
-  const Child = ToMergedT(pi.child, next_context.realign(.fromByteUnits(pi.alignment)));
 
-  return opaque {
+  const Retval = opaque {
+    const next_context = context.realign(.fromByteUnits(pi.alignment)).see(T, @This());
+    const Child = ToMergedT(pi.child, next_context);
+
     const S = Bytes(Signature.alignment);
     pub const Signature = MergedSignature{
       .T = T,
@@ -229,6 +221,9 @@ pub fn GetOnePointerMergedT(T: type, context: Context) type {
       return new_size;
     }
   };
+
+  if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
+  return Retval;
 }
 
 pub fn GetSliceMergedT(T: type, context: Context) type {
@@ -241,16 +236,17 @@ pub fn GetSliceMergedT(T: type, context: Context) type {
 
   const pi = @typeInfo(T).pointer;
   std.debug.assert(pi.size == .slice);
-
-  var next_options = context.options;
-  if (!context.seen_recursive) next_options.deslice -= 1;
-  const next_context = context.reop(next_options).see(T);
-
   const Slice = GetDirectMergedT(T, context);
-  const Child = ToMergedT(pi.child, next_context.realign(.fromByteUnits(pi.alignment)));
-  const SubStatic = !std.meta.hasFn(Child, "getDynamicSize");
 
-  return opaque {
+  const Retval = opaque {
+    const next_context = context.realign(.fromByteUnits(pi.alignment)).see(T, @This());
+    const next_options = blk: {
+      var retval = context.options;
+      if (next_context.seen_recursive == -1) retval.deslice -= 1;
+      break :blk retval;
+    };
+    const Child = ToMergedT(pi.child, next_context.reop(next_options));
+    const SubStatic = !std.meta.hasFn(Child, "getDynamicSize");
     const S = Bytes(Signature.alignment);
     pub const Signature = MergedSignature{
       .T = T,
@@ -297,6 +293,9 @@ pub fn GetSliceMergedT(T: type, context: Context) type {
       return new_size;
     }
   };
+
+  if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
+  return Retval;
 }
 
 pub fn GetArrayMergedT(T: type, context: Context) type {
@@ -353,37 +352,35 @@ pub fn GetStructMergedT(T: type, context: Context) type {
   if (!context.options.recurse) return GetDirectMergedT(T, context);
 
   const si = @typeInfo(T).@"struct";
-  const next_context = context.see(T);
 
-  const ProcessedField = struct {
-    original: std.builtin.Type.StructField,
-    merged: type,
-    static_offset: usize,
-  };
+  const Retval = opaque {
+    const next_context = context.see(T, @This());
 
-  const fields = comptime blk: {
-    var pfields: [si.fields.len]ProcessedField = undefined;
+    const ProcessedField = struct {
+      original: std.builtin.Type.StructField,
+      merged: type,
+      static_offset: usize,
+    };
 
-    for (si.fields, 0..) |f, i| {
-      const MergedChild = ToMergedT(f.type, next_context.realign(if (si.layout == .@"packed") .@"1" else .fromByteUnits(f.alignment)));
-      pfields[i] = .{
-        .original = f,
-        .merged = MergedChild,
-        .static_offset = @offsetOf(T, f.name),
-      };
-    }
-    break :blk pfields;
-  };
+    const fields = blk: {
+      var pfields: [si.fields.len]ProcessedField = undefined;
 
-  const FirstNonStaticT = comptime blk: {
-    for (si.fields, 0..) |f, i| if (std.meta.hasFn(f.type, "getDynamicSize")) break :blk i;
-    break :blk si.fields.len;
-  };
+      for (si.fields, 0..) |f, i| {
+        const MergedChild = ToMergedT(f.type, next_context.realign(if (si.layout == .@"packed") .@"1" else .fromByteUnits(f.alignment)));
+        pfields[i] = .{
+          .original = f,
+          .merged = MergedChild,
+          .static_offset = @offsetOf(T, f.name),
+        };
+      }
+      break :blk pfields;
+    };
 
-  if (FirstNonStaticT == si.fields.len) return GetDirectMergedT(T, context);
-  if (si.layout == .@"packed") @compileError("Packed structs with dynamic data are not supported");
+    const FirstNonStaticT = blk: {
+      for (si.fields, 0..) |f, i| if (std.meta.hasFn(f.type, "getDynamicSize")) break :blk i;
+      break :blk si.fields.len;
+    };
 
-  return opaque {
     const S = Bytes(Signature.alignment);
     pub const Signature = MergedSignature{
       .T = T,
@@ -427,6 +424,11 @@ pub fn GetStructMergedT(T: type, context: Context) type {
       return new_size;
     }
   };
+
+  if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
+  if (Retval.FirstNonStaticT == si.fields.len) return GetDirectMergedT(T, context);
+  if (si.layout == .@"packed") @compileError("Packed structs with dynamic data are not supported");
+  return Retval;
 }
 
 pub fn GetOptionalMergedT(T: type, context: Context) type {
@@ -537,53 +539,44 @@ pub fn GetUnionMergedT(T: type, context: Context) type {
     @compileError("Cannot merge untagged union " ++ @typeName(T));
   }
 
-  const next_context = context.see(T);
+  const Retval = opaque {
+    const next_context = context.see(T, @This());
 
-  const ProcessedField = struct {
-    original: std.builtin.Type.UnionField,
-    merged: type,
-  };
+    const ProcessedField = struct {
+      original: std.builtin.Type.UnionField,
+      merged: type,
+    };
 
-  const fields = comptime blk: {
-    var pfields: [ui.fields.len]ProcessedField = undefined;
-    for (ui.fields, 0..) |f, i| {
-      if (f.alignment < @alignOf(f.type)) {
-        @compileError("Underaligned union fields cause memory corruption!\n"); // https://github.com/ziglang/zig/issues/19404, https://github.com/ziglang/zig/issues/21343
+    const fields = blk: {
+      var pfields: [ui.fields.len]ProcessedField = undefined;
+      for (ui.fields, 0..) |f, i| {
+        if (f.alignment < @alignOf(f.type)) {
+          @compileError("Underaligned union fields cause memory corruption!\n"); // https://github.com/ziglang/zig/issues/19404, https://github.com/ziglang/zig/issues/21343
+        }
+        pfields[i] = .{
+          .original = f,
+          .merged = ToMergedT(f.type, next_context.realign(.fromByteUnits(f.alignment))),
+        };
       }
-      pfields[i] = .{
-        .original = f,
-        .merged = ToMergedT(f.type, next_context.realign(.fromByteUnits(f.alignment))),
-      };
-    }
-    break :blk pfields;
-  };
+      break :blk pfields;
+    };
 
-  if (comptime blk: {
-    for (fields) |f| {
-      if (std.meta.hasFn(f.merged, "getDynamicSize")) {
-        break :blk false;
-      }
-    }
-    break :blk true;
-  }) return GetDirectMergedT(T, context);
+    const Tag = ToMergedT(ui.tag_type.?, context.realign(null));
+    const max_child_static_size = blk: {
+      var max_size: usize = 0;
+      for (fields) |f| max_size = @max(max_size, f.merged.Signature.static_size);
+      break :blk max_size;
+    };
 
-  const Tag = ToMergedT(ui.tag_type.?, context.realign(null));
-  const max_child_static_size = blk: {
-    var max_size: usize = 0;
-    for (fields) |f| max_size = @max(max_size, f.merged.Signature.static_size);
-    break :blk max_size;
-  };
+    const max_child_static_alignment = blk: {
+      var max_align: u29 = 1;
+      for (fields) |f| max_align = @max(max_align, f.merged.Signature.alignment.toByteUnits());
+      break :blk max_align;
+    };
 
-  const max_child_static_alignment = blk: {
-    var max_align: u29 = 1;
-    for (fields) |f| max_align = @max(max_align, f.merged.Signature.alignment.toByteUnits());
-    break :blk max_align;
-  };
+    const alignment: std.mem.Alignment = context.align_hint orelse .fromByteUnits(@alignOf(T));
+    const tag_first = Tag.Signature.alignment.toByteUnits() > max_child_static_alignment;
 
-  const alignment: std.mem.Alignment = context.align_hint orelse .fromByteUnits(@alignOf(T));
-  const tag_first = Tag.Signature.alignment.toByteUnits() > max_child_static_alignment;
-
-  return opaque {
     const S = Bytes(Signature.alignment);
     pub const Signature = MergedSignature{
       .T = T,
@@ -636,6 +629,18 @@ pub fn GetUnionMergedT(T: type, context: Context) type {
       unreachable;
     }
   };
+
+  if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
+  if (comptime blk: {
+    for (Retval.fields) |f| {
+      if (std.meta.hasFn(f.merged, "getDynamicSize")) {
+        break :blk false;
+      }
+    }
+    break :blk true;
+  }) return GetDirectMergedT(T, context);
+
+  return Retval;
 }
 
 pub fn ToMergedT(T: type, context: Context) type {
@@ -673,11 +678,7 @@ const expectEqual = @import("testing.zig").expectEqual;
 
 fn _testMergingDemerging(value: anytype, comptime options: ToMergedOptions) !void {
   const T = @TypeOf(value);
-  const MergedT = ToMergedT(T, .{
-    .align_hint = null,
-    .seen_types = &.{},
-    .options = options,
-  });
+  const MergedT = ToMergedT(T, .init(options));
 
   const static_size = MergedT.Signature.static_size;
   var static_buffer: [static_size]u8 = undefined;
@@ -709,7 +710,7 @@ test "primitives" {
 test "pointers" {
   var x: u64 = 12345;
   try testMerging(&x);
-  try _testMergingDemerging(&x, .{ .T = *u64, .dereference = 0, .error_on_0_dereference = false });
+  try _testMergingDemerging(&x, .{ .T = *u64, .dereference = false });
 }
 
 test "slices" {
@@ -1118,61 +1119,59 @@ test "deep optional and pointer nesting" {
   try testMerging(DeepOptional{ .val = @as(??*const u32, null) });
 }
 
-// TODO: Make the compiler not crash
+test "recursion limit with dereference" {
+  const Node = struct {
+    payload: u32,
+    next: ?*const @This(),
+  };
 
-// test "recursion limit with dereference" {
-//   const Node = struct {
-//     payload: u32,
-//     next: ?*const @This(),
-//   };
-//
-//   const n3 = Node{ .payload = 3, .next = null };
-//   const n2 = Node{ .payload = 2, .next = &n3 };
-//   const n1 = Node{ .payload = 1, .next = &n2 };
-//
-//   // This should only serialize n1 and the pointer to n2. 
-//   // The `write` for n2 will hit the dereference limit and treat it as a direct (raw pointer) value.
-//   try _testMergingDemerging(n1, .{ .T = Node, .allow_recursive_rereferencing = true });
-// }
+  const n3 = Node{ .payload = 3, .next = null };
+  const n2 = Node{ .payload = 2, .next = &n3 };
+  const n1 = Node{ .payload = 1, .next = &n2 };
 
-// test "recursive type merging" {
-//   const Node = struct {
-//     payload: u32,
-//     next: ?*const @This(),
-//   };
-//
-//   const n4 = Node{ .payload = 4, .next = undefined };
-//   const n3 = Node{ .payload = 3, .next = &n4 };
-//   const n2 = Node{ .payload = 2, .next = &n3 };
-//   const n1 = Node{ .payload = 1, .next = &n2 };
-//
-//   try _testMergingDemerging(n1, .{ .T = Node, .allow_recursive_rereferencing = true  });
-// }
+  // This should only serialize n1 and the pointer to n2. 
+  // The `write` for n2 will hit the dereference limit and treat it as a direct (raw pointer) value.
+  try _testMergingDemerging(n1, .{ .T = Node, .allow_recursive_rereferencing = true });
+}
 
-// test "mutual recursion" {
-//   const Namespace = struct {
-//     const NodeA = struct {
-//       name: []const u8,
-//       b: ?*const NodeB,
-//     };
-//     const NodeB = struct {
-//       value: u32,
-//       a: ?*const NodeA,
-//     };
-//   };
-//
-//   const NodeA = Namespace.NodeA;
-//   const NodeB = Namespace.NodeB;
-//
-//   // Create a linked list: a1 -> b1 -> a2 -> null
-//   const a2 = NodeA{ .name = "a2", .b = null };
-//   const b1 = NodeB{ .value = 100, .a = &a2 };
-//   const a1 = NodeA{ .name = "a1", .b = &b1 };
-//
-//   // Default behavior, does not flatten.
-//   try _testMergingDemerging(a1, .{ .T = NodeA });
-//
-//   // Flatten the recursion once.
-//   try _testMergingDemerging(a1, .{ .T = NodeA, .allow_recursive_rereferencing = true });
-// }
+test "recursive type merging" {
+  const Node = struct {
+    payload: u32,
+    next: ?*const @This(),
+  };
+
+  const n4 = Node{ .payload = 4, .next = undefined };
+  const n3 = Node{ .payload = 3, .next = &n4 };
+  const n2 = Node{ .payload = 2, .next = &n3 };
+  const n1 = Node{ .payload = 1, .next = &n2 };
+
+  try _testMergingDemerging(n1, .{ .T = Node, .allow_recursive_rereferencing = true  });
+}
+
+test "mutual recursion" {
+  const Namespace = struct {
+    const NodeA = struct {
+      name: []const u8,
+      b: ?*const NodeB,
+    };
+    const NodeB = struct {
+      value: u32,
+      a: ?*const NodeA,
+    };
+  };
+
+  const NodeA = Namespace.NodeA;
+  const NodeB = Namespace.NodeB;
+
+  // Create a linked list: a1 -> b1 -> a2 -> null
+  const a2 = NodeA{ .name = "a2", .b = null };
+  const b1 = NodeB{ .value = 100, .a = &a2 };
+  const a1 = NodeA{ .name = "a1", .b = &b1 };
+
+  // Default behavior, does not flatten.
+  try _testMergingDemerging(a1, .{ .T = NodeA });
+
+  // Flatten the recursion once.
+  try _testMergingDemerging(a1, .{ .T = NodeA, .allow_recursive_rereferencing = true });
+}
 
