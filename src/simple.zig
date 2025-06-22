@@ -680,3 +680,32 @@ pub fn GetUnionMergedT(T: type, context: Context) !type {
   };
 }
 
+pub fn ToMergedT(T: type, context: Context) !type {
+  @setEvalBranchQuota(1000_000);
+  return switch (@typeInfo(T)) {
+    .type, .noreturn, .comptime_int, .comptime_float, .undefined, .@"fn", .frame, .@"anyframe", .enum_literal => blk: {
+      @compileLog("Type '" ++ @tagName(std.meta.activeTag(@typeInfo(T))) ++ "' is not mergeable\n");
+      break :blk error.NonMergeableType;
+    },
+    .void, .bool, .int, .float, .vector, .error_set, .null => GetDirectMergedT(T, context),
+    .pointer => |pi| switch (pi.size) {
+      .many, .c => if (context.options.serialize_unknown_pointer_as_usize) GetDirectMergedT(T, context) else blk: {
+        @compileLog(@tagName(pi.size) ++ " pointer cannot be serialized for type " ++ @typeName(T) ++ ", consider setting serialize_many_pointer_as_usize to true\n");
+        break :blk error.NonMergeablePointerType;
+      },
+      .one => GetOnePointerMergedT(T, context),
+      .slice => GetSliceMergedT(T, context),
+    },
+    .array => GetArrayMergedT(T, context),
+    .@"struct" => GetStructMergedT(T, context),
+    .optional => GetOptionalMergedT(T, context),
+    .error_union => GetErrorUnionMergedT(T, context),
+    .@"enum" => GetDirectMergedT(T, context),
+    .@"union" => GetUnionMergedT(T, context),
+    .@"opaque" => if (@hasDecl(T, "Signature") and @hasField(T.Signature, "T") and @FieldType(T.Signature, "T") == type) T else blk: {
+      @compileLog("A non-mergeable opaque " ++ @typeName(T) ++ " was provided to `ToMergedT`\n");
+      break :blk error.NonMergeableOpaque;
+    },
+  };
+}
+
