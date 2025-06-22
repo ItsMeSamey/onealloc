@@ -201,7 +201,8 @@ pub fn GetOnePointerMergedT(T: type, context: Context) !type {
     }
   }
 
-  const pi = @typeInfo(T).pointer;
+  const is_optional = if (@typeInfo(T) == .optional) true else false;
+  const pi = @typeInfo(if (is_optional) @typeInfo(T).optional.child else T).pointer;
   std.debug.assert(pi.size == .one);
 
   var next_options = context.options;
@@ -216,7 +217,7 @@ pub fn GetOnePointerMergedT(T: type, context: Context) !type {
     const S = Bytes(Signature.alignment);
     pub const Signature = MergedSignature{
       .T = T,
-      .D = Bytes(Child.Signature.alignment),
+      .D = Bytes(if (is_optional) .@"1" else Child.Signature.alignment),
       .static_size = Pointer.Signature.static_size,
       .alignment = context.align_hint orelse .fromByteUnits(@alignOf(T)),
     };
@@ -227,21 +228,23 @@ pub fn GetOnePointerMergedT(T: type, context: Context) !type {
 
       // TODO: Add a function to fix portability issues with pointers
       Pointer.write(&dynamic.ptr, static, undefined);
+      if (is_optional and val.* == null) return 0;
 
       const child_static = dynamic.till(Child.Signature.static_size);
       const child_dynamic = dynamic.from(Child.Signature.static_size);
-      const written = Child.write(val.*, child_static, child_dynamic.alignForward(Child.Signature.D.alignment));
+      const written = Child.write(if (is_optional) val.*.? else val.*, child_static, child_dynamic.alignForward(Child.Signature.D.alignment));
 
       return Child.Signature.static_size + written;
     }
 
     pub fn getDynamicSize(val: *const T, size: usize) usize {
       std.debug.assert(std.mem.isAligned(size, Signature.D.alignment.toByteUnits()));
-      var new_size = size + Child.Signature.static_size;
+      if (is_optional and val.* == null) return size;
 
+      var new_size = size + Child.Signature.static_size;
       if (std.meta.hasFn(Child, "getDynamicSize")) {
         new_size = std.mem.alignForward(usize, new_size, Child.Signature.D.alignment.toByteUnits());
-        new_size = Child.getDynamicSize(val.*, new_size);
+        new_size = Child.getDynamicSize(if (is_optional) val.*.? else val.*, new_size);
       }
 
       return new_size;
@@ -459,6 +462,106 @@ pub fn GetStructMergedT(T: type, context: Context) !type {
   };
 }
 
+pub fn GetOptionalMergedT(T: type, context: Context) !type {
+  const oi = @typeInfo(T).optional;
+  if (@typeInfo(oi.child) == .pointer) return GetOnePointerMergedT(T, context);
+
+  const Child = try ToMergedT(oi.child, context);
+  if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(T, context);
+  const Tag = try ToMergedT(bool, context);
+
+  const alignment = context.align_hint orelse .fromByteUnits(@alignOf(T));
+  return opaque {
+    const S = Bytes(Signature.alignment);
+    pub const Signature = MergedSignature{
+      .T = T,
+      .D = Bytes(.@"1"),
+      .static_size = @sizeOf(T),
+      .alignment = alignment,
+    };
+
+    pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
+      std.debug.assert(std.mem.isAligned(static.ptr, Signature.alignment.toByteUnits()));
+      const tag_static = static.from(Child.Signature.static_size);
+      const child_static = static.till(Child.Signature.static_size);
+
+      if (val.*) |*payload_val| {
+        std.debug.assert(0 == Tag.write(&@as(bool, true), tag_static, undefined));
+        const aligned_dynamic = dynamic.alignForward(Child.Signature.D.alignment);
+        const written = Child.write(payload_val, child_static, aligned_dynamic);
+        return written + @intFromPtr(aligned_dynamic.ptr) - @intFromPtr(dynamic.ptr);
+      } else {
+        std.debug.assert(0 == Tag.write(&@as(bool, false), tag_static, undefined));
+        return 0;
+      }
+    }
+
+    pub fn getDynamicSize(val: *const T, size: usize) usize {
+      if (val.*) |*payload_val| {
+        size = std.mem.alignForward(usize, size, Tag.Signature.alignment.toByteUnits());
+        return Child.getDynamicSize(payload_val, size);
+      } else {
+        return size;
+      }
+    }
+  };
+}
+
+pub fn GetErrorUnionMergedT(T: type, context: Context) !type {
+  const ei = @typeInfo(T).error_union;
+  const Payload = ei.payload;
+  const ErrorSet = ei.error_set;
+  const ErrorInt = std.meta.Int(.unsigned, @bitSizeOf(ErrorSet));
+
+  const Child = try ToMergedT(Payload, context);
+  if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(T, context);
+  const Err = try ToMergedT(ErrorInt, context);
+
+  const ErrSize = Err.Signature.static_size;
+  const PayloadSize = Child.Signature.static_size;
+  const PayloadBeforeError = PayloadSize >= ErrSize;
+  const UnionSize = if (PayloadSize < ErrSize) 2 * ErrSize
+    else if (PayloadSize <= 16) 2 * PayloadSize
+    else PayloadSize + 16;
+
+  return opaque {
+    const S = Bytes(Signature.alignment);
+    pub const Signature = MergedSignature{
+      .T = T,
+      .D = Bytes(.@"1"),
+      .static_size = UnionSize,
+      .alignment = std.mem.Alignment.max(Child.Signature.alignment, Err.Signature.alignment),
+    };
+
+    pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
+      std.debug.assert(std.mem.isAligned(static.ptr, Signature.alignment.toByteUnits()));
+
+      const payload_buffer = if (PayloadBeforeError) static.till(PayloadSize) else static.from(ErrSize);
+      const error_buffer = if (PayloadBeforeError) static.from(PayloadSize) else static.till(ErrSize);
+
+      if (val.*) |*payload_val| {
+        std.debug.assert(0 == Err.write(&@as(ErrorInt, 0), error_buffer, undefined));
+        const aligned_dynamic = dynamic.alignForward(Child.Signature.D.alignment);
+        const written = Child.write(payload_val, payload_buffer, aligned_dynamic);
+        return written + @intFromPtr(aligned_dynamic.ptr) - @intFromPtr(dynamic.ptr);
+      } else |err| {
+        const error_int: ErrorInt = @intFromEnum(err);
+        std.debug.assert(0 == Err.write(&error_int, error_buffer, undefined));
+        return 0;
+      }
+    }
+
+    pub fn getDynamicSize(val: *const T, size: usize) usize {
+      if (val.*) |*payload_val| {
+        const new_size = size.alignForward(Child.Signature.D.alignment.toByteUnits());
+        return Child.getDynamicSize(payload_val, new_size);
+      } else {
+        return size;
+      }
+    }
+  };
+}
+
 pub fn GetUnionMergedT(T: type, context: Context) !type {
   if (context.options.recurse == 0) {
     if (context.options.error_on_0_recurse) {
@@ -573,61 +676,6 @@ pub fn GetUnionMergedT(T: type, context: Context) !type {
         }
       }
       unreachable;
-    }
-  };
-}
-
-pub fn GetErrorUnionMergedT(T: type, context: Context) !type {
-  const ei = @typeInfo(T).error_union;
-  const Payload = ei.payload;
-  const ErrorSet = ei.error_set;
-  const ErrorInt = std.meta.Int(.unsigned, @bitSizeOf(ErrorSet));
-
-  const Child = try ToMergedT(Payload, context);
-  if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(T, context);
-  const Err = try ToMergedT(ErrorInt, context);
-
-  const ErrSize = Err.Signature.static_size;
-  const PayloadSize = Child.Signature.static_size;
-  const PayloadBeforeError = PayloadSize >= ErrSize;
-  const UnionSize = if (PayloadSize < ErrSize) 2 * ErrSize
-    else if (PayloadSize <= 16) 2 * PayloadSize
-    else PayloadSize + 16;
-
-  return opaque {
-    const S = Bytes(Signature.alignment);
-    pub const Signature = MergedSignature{
-      .T = T,
-      .D = Bytes(.@"1"),
-      .static_size = UnionSize,
-      .alignment = std.mem.Alignment.max(Child.Signature.alignment, Err.Signature.alignment),
-    };
-
-    pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
-      std.debug.assert(std.mem.isAligned(static.ptr, Signature.alignment.toByteUnits()));
-
-      const payload_buffer = if (PayloadBeforeError) static.till(PayloadSize) else static.from(ErrSize);
-      const error_buffer = if (PayloadBeforeError) static.from(PayloadSize) else static.till(ErrSize);
-
-      if (val.*) |*payload_val| {
-        std.debug.assert(0 == Err.write(&@as(ErrorInt, 0), error_buffer, undefined));
-        const aligned_dynamic = dynamic.alignForward(Child.Signature.D.alignment);
-        const written = Child.write(payload_val, payload_buffer, aligned_dynamic);
-        return written + @intFromPtr(aligned_dynamic.ptr) - @intFromPtr(dynamic.ptr);
-      } else |err| {
-        const error_int: ErrorInt = @intFromEnum(err);
-        std.debug.assert(0 == Err.write(&error_int, error_buffer, undefined));
-        return 0;
-      }
-    }
-
-    pub fn getDynamicSize(val: *const T, size: usize) usize {
-      if (val.*) |*payload_val| {
-        const new_size = size.alignForward(Child.Signature.D.alignment.toByteUnits());
-        return Child.getDynamicSize(payload_val, new_size);
-      } else {
-        return size;
-      }
     }
   };
 }
