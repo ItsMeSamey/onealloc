@@ -204,4 +204,30 @@ try testing.expect(p.next.?.payload == 2);
 try testing.expect(p.next.?.next == null);
 ```
 
-When this option is enabled, the library tracks the types it has seen. When it encounters a type for the second time, instead of recursing again, it creates a "back-reference" to the already-generated merger for that type, correctly handling the recursion without infinite loops.
+OR
+
+```zig
+const Namespace = struct {
+    const NodeA = struct {
+        name: []const u8,
+        b: ?*const NodeB,
+    };
+    const NodeB = struct {
+        value: u32,
+        a: ?*const NodeA,
+    };
+};
+
+const NodeA = Namespace.NodeA;
+const NodeB = Namespace.NodeB;
+
+// Create a linked list: a1 -> b1 -> a2 -> null
+const a2 = NodeA{ .name = "a2", .b = null };
+const b1 = NodeB{ .value = 100, .a = &a2 };
+const a1 = NodeA{ .name = "a1", .b = &b1 };
+
+const List = onealloc.SimpleWrapper(.{ .T = NodeA, .allow_recursive_rereferencing = true });
+
+// List with doubley recursive types merged into a contiguous allocation
+const copy = SimpleWrapper.init(allocator, a1);
+```
