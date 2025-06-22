@@ -147,11 +147,6 @@ pub fn Bytes(comptime _alignment: std.mem.Alignment) type {
         ._len = self._len - (aligned_ptr - @intFromPtr(self.ptr)) // Underflow => user error
       };
     }
-
-    pub fn convertForward(other: anytype) @This() {
-      const retval: @This() = .{ .ptr = other.ptr, ._len = other._len };
-      return retval.alignForward(.fromByteUnits(other.alignment));
-    }
   };
 }
 
@@ -209,18 +204,22 @@ pub fn GetOnePointerMergedT(context: Context) type {
       const dptr: T = @ptrCast(@alignCast(dynamic.ptr));
       std.debug.assert(0 == Pointer.write(&dptr, static, undefined));
 
-      const child_static =  dynamic.till(Child.Signature.static_size);
+      const child_static = dynamic.till(Child.Signature.static_size);
       const child_dynamic = dynamic.from(Child.Signature.static_size).alignForward(.fromByteUnits(Child.Signature.D.alignment));
       const written = Child.write(if (is_optional) val.*.? else val.*, child_static, child_dynamic);
 
-      return Child.Signature.static_size + written;
+      return written + @intFromPtr(child_dynamic.ptr) - @intFromPtr(_dynamic.ptr);
     }
 
     pub fn getDynamicSize(val: *const T, size: usize) usize {
       std.debug.assert(std.mem.isAligned(size, Signature.D.alignment));
-      if (is_optional and val.* == null) return size;
+      var new_size = size;
+      if (is_optional) {
+        if (val.* == null) return new_size;
+        new_size = std.mem.alignForward(usize, new_size, Child.Signature.alignment.toByteUnits());
+      }
 
-      var new_size = size + Child.Signature.static_size;
+      new_size += Child.Signature.static_size;
       if (std.meta.hasFn(Child, "getDynamicSize")) {
         new_size = std.mem.alignForward(usize, new_size, Child.Signature.D.alignment);
         new_size = Child.getDynamicSize(if (is_optional) val.*.? else val.*, new_size);
@@ -480,7 +479,7 @@ pub fn GetOptionalMergedT(context: Context) type {
 
     pub fn getDynamicSize(val: *const T, size: usize) usize {
       if (val.*) |*payload_val| {
-        const new_size = std.mem.alignForward(usize, size, Tag.Signature.alignment.toByteUnits());
+        const new_size = std.mem.alignForward(usize, size, Child.Signature.D.alignment);
         return Child.getDynamicSize(payload_val, new_size);
       } else {
         return size;
@@ -1305,12 +1304,11 @@ pub fn Wrapper(options: ToMergedOptions) type {
     /// Set a new value into the wrapper. Invalidates any references to the old value
     /// Expects there to be no data cycles
     pub fn set(self: *@This(), allocator: std.mem.Allocator, value: *const options.T) !void {
-      const memory = try allocator.realloc(u8, self.memory, getSize(value));
+      const memory = try allocator.realloc(self.memory, getSize(value));
+      self.memory = memory;
 
       const dynamic_buffer = MergedT.Signature.D.init(memory[MergedT.Signature.static_size..]).alignForward(.fromByteUnits(MergedT.Signature.D.alignment));
       _ = MergedT.write(value, .initAssert(memory[0..MergedT.Signature.static_size]), dynamic_buffer);
-
-      return .{ .memory = memory };
     }
 
     /// Set a new value into the wrapper, asserting that underlying allocation can hold it. Invalidates any references to the old value
