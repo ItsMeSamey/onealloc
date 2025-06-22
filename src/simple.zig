@@ -1175,3 +1175,75 @@ test "mutual recursion" {
   try _testMergingDemerging(a1, .{ .T = NodeA, .allow_recursive_rereferencing = true });
 }
 
+test "deeply nested, mutually recursive structures with no data cycles" {
+  const Namespace = struct {
+    const MegaStructureA = struct {
+      id: u32,
+      description: []const u8,
+      next: ?*const @This(), // Direct recursion: A -> A
+      child_b: *const NodeB, // Mutual recursion: A -> B
+    };
+
+    const NodeB = struct {
+      value: f64,
+      relatives: [2]?*const @This(), // Direct recursion: B -> [2]B
+      next_a: ?*const MegaStructureA, // Mutual recursion: B -> A
+      leaf: ?*const LeafNode, // Points to a simple terminal node
+    };
+
+    const LeafNode = struct {
+      data: []const u8,
+    };
+  };
+
+  const MegaStructureA = Namespace.MegaStructureA;
+  const NodeB = Namespace.NodeB;
+  const LeafNode = Namespace.LeafNode;
+
+  const leaf1 = LeafNode{ .data = "Leaf Node One" };
+  const leaf2 = LeafNode{ .data = "Leaf Node Two" };
+
+  const b_leaf_1 = NodeB{
+    .value = 1.1,
+    .next_a = null,
+    .relatives = .{ null, null },
+    .leaf = &leaf1,
+  };
+  const b_leaf_2 = NodeB{
+    .value = 2.2,
+    .next_a = null,
+    .relatives = .{ null, null },
+    .leaf = &leaf2,
+  };
+
+  const a_intermediate = MegaStructureA{
+    .id = 100,
+    .description = "Intermediate A",
+    .next = null, // Terminates this A-chain
+    .child_b = &b_leaf_1,
+  };
+
+  const b_middle = NodeB{
+    .value = 3.3,
+    .next_a = &a_intermediate,
+    .relatives = .{ &b_leaf_1, &b_leaf_2 },
+    .leaf = null,
+  };
+
+  const a_before_root = MegaStructureA{
+    .id = 200,
+    .description = "Almost Root A",
+    .next = null,
+    .child_b = &b_leaf_2,
+  };
+
+  const root_node = MegaStructureA{
+    .id = 1,
+    .description = "The Root",
+    .next = &a_before_root,
+    .child_b = &b_middle,
+  };
+
+  try _testMergingDemerging(root_node, .{ .T = MegaStructureA, .allow_recursive_rereferencing = true });
+}
+
