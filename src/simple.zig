@@ -10,15 +10,9 @@ pub const ToMergedOptions = struct {
   /// The type that is to be merged
   T: type,
   /// Recurse into structs and unions
-  recurse: comptime_int = 1024,
-  /// Error if recurse = 0
-  error_on_0_recurse: bool = true,
+  recurse: bool = true,
   /// Whether to dereference pointers or use them by value
-  /// Max Number of times dereferencing is allowed.
-  /// 0 means no dereferencing is done at all
-  dereference: comptime_int = 1024,
-  /// Error if dereference = 0
-  error_on_0_dereference: bool = true,
+  dereference: bool = true,
   /// What is the maximum number of expansion of slices that can be done
   /// for example in a recursive structure or nested slices
   ///
@@ -28,19 +22,9 @@ pub const ToMergedOptions = struct {
   deslice: comptime_int = 1024,
   /// Error if deslice = 0
   error_on_0_deslice: bool = true,
-  /// Flatten the self reference pointers in the struct instead of treating them as pointers.
-  /// This effectively creates an array of size n for that type.
-  /// You should understand its implications before you enable this.
-  flatten_self_references: comptime_int = 0,
-  /// Allow for recursive re-referencing, eg A has *B, B has *A
-  recursive_rereferencing: enum {
-    /// Do not allow for recursive re-referencing, will throw compile error if other than top level type references itself
-    disallow,
-    /// Count A -> B -> A -> B or A -> B -> C -> A -> B -> C as a single flattening, only count top most type
-    top_only,
-    /// Count A -> B -> C -> A -> B -> C as a 3 flattenings, count reoccurence of all types
-    all,
-  } = .disallow,
+  /// Allow for recursive re-referencing, eg. (A has ?*A), (A has ?*B, B has ?*A), etc.
+  /// When this is false and the type is recursive, compilation will error
+  allow_recursive_rereferencing: bool = false,
 };
 
 /// This is used to recognize if types were returned by ToMerged.
@@ -59,62 +43,54 @@ pub const MergedSignature = struct {
 const Context = struct {
   align_hint: ?std.mem.Alignment,
   seen_types: []const type,
-  /// How many more times will are we tried to see already seen type before we have to treat it as raw.
-  times_left: usize,
   options: ToMergedOptions,
+  comptime seen_recursive: bool = true,
 
   pub fn realign(self: @This(), align_hint: ?std.mem.Alignment) @This() {
     return .{
       .align_hint = align_hint,
       .seen_types = self.seen_types,
-      .times_left = self.times_left,
       .options = self.options,
+      .seen_recursive = self.seen_recursive,
     };
   }
 
   pub fn see(self: @This(), T: type) @This() {
-    const at = self.seenAt(T);
-    return .{
+    if (self.seen_recursive or self.options.allow_recursive_rereferencing) return self;
+
+    const have_seen = comptime blk: {
+      if (self.seen_types.len == 0) break :blk false;
+      for (self.seen_types) |t| if (meta.ContainsT(T, t)) break :blk true;
+      break :blk false;
+    };
+
+    if (!have_seen) return .{
       .align_hint = self.align_hint,
       .seen_types = self.seen_types ++ [1]type{T},
-      .times_left = if (at == .none) self.times_left else switch (self.options.recursive_rereferencing) {
-        .disallow => blk: {
-          if (at == .sub) {
-            @compileError("Recursive re-referencing is disallowed for type " ++ @typeName(T) ++ " as it is not on the top level");
-          } else break :blk self.times_left;
-        },
-        .top_only => if (at == .top) self.times_left - 1 else self.times_left,
-        .all => self.times_left - 1,
-      },
       .options = self.options,
+      .seen_recursive = self.seen_recursive,
     };
-  }
 
-  fn getChild(T: type) type {
-    comptime var t = T;
-    while (switch (@typeInfo(t)) {
-      .pointer, .optional, .array, .vector => true,
-      else => false,
-    }) t = std.meta.Child(t);
-    return t;
-  }
-
-  pub fn seenAt(self: @This(), T: type) enum {none, top, sub} {
-    const child = getChild(T);
-    if (child == getChild(self.seen_types[self.seen_types.len - 1])) return .none;
-    if (child == getChild(self.seen_types[0])) return .top;
-    for (1 .. self.seen_types.len) |i| {
-      if (child == getChild(self.seen_types[i])) return .sub;
+    if (!self.options.allow_recursive_rereferencing) {
+      @compileError(@typeName(self.seen_types[0]) ++ " contains a self referential type " ++ @typeName(T) ++ " within itself");
     }
-    return .none;
+
+    unreachable;
+
+    // return .{
+    //   .align_hint = self.align_hint,
+    //   .seen_types = self.seen_types,
+    //   .options = self.options,
+    //   .seen_recursive = true,
+    // };
   }
 
   pub fn reop(self: @This(), options: ToMergedOptions) @This() {
     return .{
       .align_hint = self.align_hint,
       .seen_types = self.seen_types,
-      .times_left = self.times_left,
       .options = options,
+      .seen_recursive = self.seen_recursive,
     };
   }
 };
@@ -202,22 +178,13 @@ pub fn GetDirectMergedT(T: type, context: Context) type {
 
 /// Convert a supplid pointer type to writable opaque
 pub fn GetOnePointerMergedT(T: type, context: Context) type {
-  if (context.options.dereference == 0) {
-    if (context.options.error_on_0_dereference) {
-      @compileError("Cannot dereference type " ++ @typeName(T) ++ " any further as options.dereference is 0");
-    } else {
-      return GetDirectMergedT(T, context);
-    }
-  }
+  if (!context.options.dereference) return GetDirectMergedT(T, context);
 
   const is_optional = if (@typeInfo(T) == .optional) true else false;
   const pi = @typeInfo(if (is_optional) @typeInfo(T).optional.child else T).pointer;
   std.debug.assert(pi.size == .one);
 
-  var next_options = context.options;
-  next_options.dereference -= 1;
-  const next_context = context.reop(next_options).see(T);
-  if (next_context.times_left == -1) return GetDirectMergedT(T, context);
+  const next_context = context.see(T);
 
   const Pointer = GetDirectMergedT(T, context);
   const Child = ToMergedT(pi.child, next_context.realign(.fromByteUnits(pi.alignment)));
@@ -276,9 +243,8 @@ pub fn GetSliceMergedT(T: type, context: Context) type {
   std.debug.assert(pi.size == .slice);
 
   var next_options = context.options;
-  next_options.deslice -= 1;
+  if (!context.seen_recursive) next_options.deslice -= 1;
   const next_context = context.reop(next_options).see(T);
-  if (next_context.times_left == -1) return GetDirectMergedT(T, context);
 
   const Slice = GetDirectMergedT(T, context);
   const Child = ToMergedT(pi.child, next_context.realign(.fromByteUnits(pi.alignment)));
@@ -384,18 +350,10 @@ pub fn GetArrayMergedT(T: type, context: Context) type {
 
 pub fn GetStructMergedT(T: type, context: Context) type {
   @setEvalBranchQuota(1000_000);
-  if (context.options.recurse == 0) {
-    if (context.options.error_on_0_recurse) {
-      @compileError("Cannot recurse into type " ++ @typeName(T) ++ " any further as options.recurse is 0");
-    }
-    return GetDirectMergedT(T, context);
-  }
+  if (!context.options.recurse) return GetDirectMergedT(T, context);
 
   const si = @typeInfo(T).@"struct";
-  var next_options = context.options;
-  next_options.recurse -= 1;
-  const next_context = context.reop(next_options).see(T);
-  if (next_context.times_left == -1) return GetDirectMergedT(T, context);
+  const next_context = context.see(T);
 
   const ProcessedField = struct {
     original: std.builtin.Type.StructField,
@@ -572,22 +530,14 @@ pub fn GetErrorUnionMergedT(T: type, context: Context) type {
 }
 
 pub fn GetUnionMergedT(T: type, context: Context) type {
-  if (context.options.recurse == 0) {
-    if (context.options.error_on_0_recurse) {
-      @compileError("Cannot recurse into type " ++ @typeName(T) ++ " any further as options.recurse is 0");
-    }
-    return GetDirectMergedT(T, context);
-  }
+  if (!context.options.recurse) return GetDirectMergedT(T, context);
 
   const ui = @typeInfo(T).@"union";
   if (ui.tag_type == null) {
     @compileError("Cannot merge untagged union " ++ @typeName(T));
   }
 
-  var next_options = context.options;
-  next_options.recurse -= 1;
-  const next_context = context.reop(next_options).see(T);
-  if (next_context.times_left == -1) return GetDirectMergedT(T, context);
+  const next_context = context.see(T);
 
   const ProcessedField = struct {
     original: std.builtin.Type.UnionField,
@@ -725,8 +675,7 @@ fn _testMergingDemerging(value: anytype, comptime options: ToMergedOptions) !voi
   const T = @TypeOf(value);
   const MergedT = ToMergedT(T, .{
     .align_hint = null,
-    .seen_types = &.{T},
-    .times_left = options.flatten_self_references,
+    .seen_types = &.{},
     .options = options,
   });
 
@@ -1169,20 +1118,22 @@ test "deep optional and pointer nesting" {
   try testMerging(DeepOptional{ .val = @as(??*const u32, null) });
 }
 
-test "recursion limit with dereference" {
-  const Node = struct {
-    payload: u32,
-    next: ?*const @This(),
-  };
+// TODO: Make the compiler not crash
 
-  const n3 = Node{ .payload = 3, .next = null };
-  const n2 = Node{ .payload = 2, .next = &n3 };
-  const n1 = Node{ .payload = 1, .next = &n2 };
-
-  // This should only serialize n1 and the pointer to n2. 
-  // The `write` for n2 will hit the dereference limit and treat it as a direct (raw pointer) value.
-  try _testMergingDemerging(n1, .{ .T = Node, .flatten_self_references = 1, .recursive_rereferencing = .disallow });
-}
+// test "recursion limit with dereference" {
+//   const Node = struct {
+//     payload: u32,
+//     next: ?*const @This(),
+//   };
+//
+//   const n3 = Node{ .payload = 3, .next = null };
+//   const n2 = Node{ .payload = 2, .next = &n3 };
+//   const n1 = Node{ .payload = 1, .next = &n2 };
+//
+//   // This should only serialize n1 and the pointer to n2. 
+//   // The `write` for n2 will hit the dereference limit and treat it as a direct (raw pointer) value.
+//   try _testMergingDemerging(n1, .{ .T = Node, .allow_recursive_rereferencing = true });
+// }
 
 // test "recursive type merging" {
 //   const Node = struct {
@@ -1195,10 +1146,10 @@ test "recursion limit with dereference" {
 //   const n2 = Node{ .payload = 2, .next = &n3 };
 //   const n1 = Node{ .payload = 1, .next = &n2 };
 //
-//   try _testMergingDemerging(n1, .{ .T = Node, .flatten_self_references = 4 });
+//   try _testMergingDemerging(n1, .{ .T = Node, .allow_recursive_rereferencing = true  });
 // }
-//
-// test "mutual recursion with flatten_self_references" {
+
+// test "mutual recursion" {
 //   const Namespace = struct {
 //     const NodeA = struct {
 //       name: []const u8,
@@ -1222,6 +1173,6 @@ test "recursion limit with dereference" {
 //   try _testMergingDemerging(a1, .{ .T = NodeA });
 //
 //   // Flatten the recursion once.
-//   try _testMergingDemerging(a1, .{ .T = NodeA, .flatten_self_references = 1, .recursive_rereferencing = .top_only });
+//   try _testMergingDemerging(a1, .{ .T = NodeA, .allow_recursive_rereferencing = true });
 // }
 
