@@ -601,7 +601,7 @@ pub fn GetUnionMergedT(T: type, context: Context) type {
       }
       pfields[i] = .{
         .original = f,
-        .merged = ToMergedT(f.type, next_context.realign(f.alignment)),
+        .merged = ToMergedT(f.type, next_context.realign(.fromByteUnits(f.alignment))),
       };
     }
     break :blk pfields;
@@ -942,5 +942,24 @@ test "optional" {
 
   opt_ptr = null;
   try testSerialization(opt_ptr);
+}
+
+test "error_unions" {
+  const MyError = error{Oops};
+  var eu: MyError!u32 = 123;
+  try testSerialization(eu);
+  eu = MyError.Oops;
+  try testSerialization(eu);
+}
+
+test "unions" {
+  const Payload = union(enum) {
+    a: u32,
+    b: bool,
+    c: void,
+  };
+  try testSerialization(Payload{ .a = 99 });
+  try testSerialization(Payload{ .b = false });
+  try testSerialization(Payload{ .c = {} });
 }
 
