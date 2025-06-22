@@ -762,7 +762,7 @@ fn expectEqual(expected: anytype, actual: anytype) !void {
     },
 
     .array => |array| {
-      inline for (array.len) |i| {
+      inline for (0..array.len) |i| {
         expectEqual(expected[i], actual[i]) catch |e| {
           print("index {d} incorrect. expected {any}, found {any}\n", .{ i, expected[i], actual[i] });
           return e;
@@ -894,5 +894,36 @@ test "slices" {
   try testSerialization(@as([]const u8, &.{}));
   try testSerialization(@as([]const []const u8, &.{}));
   try testSerialization(@as([]const []const u8, &.{"", "a", ""}));
+}
+
+test "arrays" {
+  // primitive
+  try testSerialization([4]u8{ 1, 2, 3, 4 });
+
+  // struct array
+  const Point = struct { x: u8, y: u8 };
+  try testSerialization([2]Point{ .{ .x = 1, .y = 2 }, .{ .x = 3, .y = 4 } });
+
+  // nested arrays
+  try testSerialization([2][2]u8{ .{ 1, 2 }, .{ 3, 4 } });
+
+  // empty
+  try testSerialization([0]u8{});
+}
+
+test "structs" {
+  // Simple
+  const Point = struct { x: i32, y: i32 };
+  try testSerialization(Point{ .x = -10, .y = 20 });
+
+  // Nested
+  const Line = struct { p1: Point, p2: Point };
+  try testSerialization(Line{ .p1 = .{ .x = 1, .y = 2 }, .p2 = .{ .x = 3, .y = 4 } });
+}
+
+test "enums" {
+  // Simple
+  const Color = enum { red, green, blue };
+  try testSerialization(Color.green);
 }
 
