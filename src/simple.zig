@@ -577,3 +577,58 @@ pub fn GetUnionMergedT(T: type, context: Context) !type {
   };
 }
 
+pub fn GetErrorUnionMergedT(T: type, context: Context) !type {
+  const ei = @typeInfo(T).error_union;
+  const Payload = ei.payload;
+  const ErrorSet = ei.error_set;
+  const ErrorInt = std.meta.Int(.unsigned, @bitSizeOf(ErrorSet));
+
+  const Child = try ToMergedT(Payload, context);
+  if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(T, context);
+  const Err = try ToMergedT(ErrorInt, context);
+
+  const ErrSize = Err.Signature.static_size;
+  const PayloadSize = Child.Signature.static_size;
+  const PayloadBeforeError = PayloadSize >= ErrSize;
+  const UnionSize = if (PayloadSize < ErrSize) 2 * ErrSize
+    else if (PayloadSize <= 16) 2 * PayloadSize
+    else PayloadSize + 16;
+
+  return opaque {
+    const S = Bytes(Signature.alignment);
+    pub const Signature = MergedSignature{
+      .T = T,
+      .D = Bytes(.@"1"),
+      .static_size = UnionSize,
+      .alignment = std.mem.Alignment.max(Child.Signature.alignment, Err.Signature.alignment),
+    };
+
+    pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
+      std.debug.assert(std.mem.isAligned(static.ptr, Signature.alignment.toByteUnits()));
+
+      const payload_buffer = if (PayloadBeforeError) static.till(PayloadSize) else static.from(ErrSize);
+      const error_buffer = if (PayloadBeforeError) static.from(PayloadSize) else static.till(ErrSize);
+
+      if (val.*) |*payload_val| {
+        std.debug.assert(0 == Err.write(&@as(ErrorInt, 0), error_buffer, undefined));
+        const aligned_dynamic = dynamic.alignForward(Child.Signature.D.alignment);
+        const written = Child.write(payload_val, payload_buffer, aligned_dynamic);
+        return written + @intFromPtr(aligned_dynamic.ptr) - @intFromPtr(dynamic.ptr);
+      } else |err| {
+        const error_int: ErrorInt = @intFromEnum(err);
+        std.debug.assert(0 == Err.write(&error_int, error_buffer, undefined));
+        return 0;
+      }
+    }
+
+    pub fn getDynamicSize(val: *const T, size: usize) usize {
+      if (val.*) |*payload_val| {
+        const new_size = size.alignForward(Child.Signature.D.alignment.toByteUnits());
+        return Child.getDynamicSize(payload_val, new_size);
+      } else {
+        return size;
+      }
+    }
+  };
+}
+
