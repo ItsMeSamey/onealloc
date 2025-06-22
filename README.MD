@@ -50,6 +50,7 @@ pub fn main() !void {
 * [Configuration (ToMergedOptions)](#configuration-tomergedoptions)
 * [How It Works: Memory Layout](#how-it-works-memory-layout)
 * [Handling Recursion](#handling-recursion)
+* [Limitations](#limitations)
 
 # Why OneAlloc?
 Structs containing several slices / pointers can lead to poor performance due to scattered memory access patterns, which is bad for CPU caching. It also makes managing the lifetime of the object complex.
