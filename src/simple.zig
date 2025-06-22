@@ -360,10 +360,10 @@ pub fn GetArrayMergedT(T: type, context: Context) type {
       var child_static = static.till(Signature.static_size);
       var child_dynamic = dynamic;
 
-      inline for (val.*) |*item| {
+      inline for (val) |*item| {
         child_dynamic = child_dynamic.alignForward(.fromByteUnits(Child.Signature.D.alignment));
         const written = Child.write(item, child_static, child_dynamic);
-        child_static = child_static.from(Child.Signature.static_size);
+        child_static = child_static.from(Child.Signature.static_size).assertAligned(Child.Signature.alignment);
         child_dynamic = child_dynamic.from(written);
       }
 
@@ -407,7 +407,7 @@ pub fn GetStructMergedT(T: type, context: Context) type {
     var pfields: [si.fields.len]ProcessedField = undefined;
 
     for (si.fields, 0..) |f, i| {
-      const MergedChild = ToMergedT(f.type, next_context.realign(.fromByteUnits(f.alignment)));
+      const MergedChild = ToMergedT(f.type, next_context.realign(if (si.layout == .@"packed") .@"1" else .fromByteUnits(f.alignment)));
       pfields[i] = .{
         .original = f,
         .merged = MergedChild,
@@ -423,6 +423,7 @@ pub fn GetStructMergedT(T: type, context: Context) type {
   };
 
   if (FirstNonStaticT == si.fields.len) return GetDirectMergedT(T, context);
+  if (si.layout == .@"packed") @compileError("Packed structs with dynamic data are not supported");
 
   return opaque {
     const S = Bytes(Signature.alignment);
@@ -655,7 +656,8 @@ pub fn GetUnionMergedT(T: type, context: Context) type {
       inline for (fields) |f| {
         const field_as_tag = comptime std.meta.stringToEnum(ui.tag_type.?, f.original.name);
         if (field_as_tag == active_tag) {
-          const child_static = if (tag_first) static.from(max_child_static_size) else static.till(f.merged.Signature.static_size);
+          const child_static = if (tag_first) static.from(max_child_static_size).assertAligned(f.merged.Signature.alignment)
+            else static.till(f.merged.Signature.static_size).assertAligned(f.merged.Signature.alignment);
 
           if (!std.meta.hasFn(f.merged, "getDynamicSize")) {
             return f.merged.write(&@field(val.*, f.original.name), child_static, undefined);
@@ -962,4 +964,232 @@ test "unions" {
   try testSerialization(Payload{ .b = false });
   try testSerialization(Payload{ .c = {} });
 }
+
+test "complex struct" {
+  const Nested = struct {
+    c: u4,
+    d: bool,
+  };
+
+  const KitchenSink = struct {
+    a: i32,
+    b: []const u8,
+    c: [2]Nested,
+    d: ?*const i32,
+    e: f32,
+  };
+
+  var value = KitchenSink{
+    .a = -1,
+    .b = "dynamic slice",
+    .c = .{ .{ .c = 1, .d = true }, .{ .c = 2, .d = false } },
+    .d = &@as(i32, 42),
+    .e = 3.14,
+  };
+
+  try testSerialization(value);
+
+  value.b = "";
+  try testSerialization(value);
+
+  value.d = null;
+  try testSerialization(value);
+}
+
+test "slice of complex structs" {
+  const Item = struct {
+    id: u64,
+    name: []const u8,
+    is_active: bool,
+  };
+
+  const items = [_]Item{
+    .{ .id = 1, .name = "first", .is_active = true },
+    .{ .id = 2, .name = "second", .is_active = false },
+    .{ .id = 3, .name = "", .is_active = true },
+  };
+
+  try testSerialization(items[0..]);
+}
+
+test "complex composition" {
+  const Complex1 = struct {
+    a: u32,
+    b: u32,
+    c: u32,
+  };
+
+  const Complex2 = struct {
+    a: Complex1,
+    b: []const Complex1,
+  };
+
+  const SuperComplex = struct {
+    a: Complex1,
+    b: Complex2,
+    c: []const union(enum) {
+      a: Complex1,
+      b: Complex2,
+    },
+  };
+
+  const value = SuperComplex{
+    .a = .{ .a = 1, .b = 2, .c = 3 },
+    .b = .{
+      .a = .{ .a = 4, .b = 5, .c = 6 },
+      .b = &.{.{ .a = 7, .b = 8, .c = 9 }},
+    },
+    .c = &.{
+      .{ .a = .{ .a = 10, .b = 11, .c = 12 } },
+      .{ .b = .{ .a = .{ .a = 13, .b = 14, .c = 15 }, .b = &.{.{ .a = 16, .b = 17, .c = 18 }} } },
+    },
+  };
+
+  try testSerialization(value);
+}
+
+test "multiple dynamic fields" {
+  const MultiDynamic = struct {
+    a: []const u8,
+    b: i32,
+    c: []const u8,
+  };
+
+  var value = MultiDynamic{
+    .a = "hello",
+    .b = 12345,
+    .c = "world",
+  };
+  try testSerialization(value);
+
+  value.a = "";
+  try testSerialization(value);
+}
+
+test "complex array" {
+  const ReorderStruct = struct {
+    a: u8,
+    b: u32, // Will be reordered with 'a'
+  };
+  const value = [2]ReorderStruct{
+    .{ .a = 1, .b = 100 },
+    .{ .a = 2, .b = 200 },
+  };
+
+  try testSerialization(value);
+}
+
+test "packed struct with mixed alignment fields" {
+  const MixedPack = packed struct {
+    a: u2,
+    b: u8,
+    c: u32,
+    d: bool,
+  };
+
+  const value = MixedPack{
+    .a = 3,
+    .b = 't',
+    .c = 1234567,
+    .d = true,
+  };
+
+  try testSerialization(value);
+}
+
+test "struct with zero-sized fields" {
+  const ZST_1 = struct {
+    a: u32,
+    b: void,
+    c: [0]u8,
+    d: []const u8,
+    e: bool,
+  };
+  try testSerialization(ZST_1{
+    .a = 123,
+    .b = {},
+    .c = .{},
+    .d = "non-zst",
+    .e = false,
+  });
+
+  const ZST_2 = struct {
+    a: u32,
+    zst1: void,
+    zst_array: [0]u64,
+    dynamic_zst_slice: []const void,
+    zst_union: union(enum) {
+      z: void,
+      d: u64,
+    },
+    e: bool,
+  };
+
+  var value_2 = ZST_2{
+    .a = 123,
+    .zst1 = {},
+    .zst_array = .{},
+    .dynamic_zst_slice = &.{ {}, {}, {} },
+    .zst_union = .{ .z = {} },
+    .e = true,
+  };
+
+  try testSerialization(value_2);
+
+  value_2.zst_union = .{ .d = 999 };
+  try testSerialization(value_2);
+}
+
+test "array of unions with dynamic fields" {
+  const Message = union(enum) {
+    text: []const u8,
+    code: u32,
+    err: void,
+  };
+
+  const messages = [3]Message{
+    .{ .text = "hello" },
+    .{ .code = 404 },
+    .{ .text = "world" },
+  };
+
+  try testSerialization(messages);
+}
+
+test "pointer and optional abuse" {
+  const Point = struct { x: i32, y: i32 };
+  const PointerAbuse = struct {
+    a: ?*const Point,
+    b: *const ?Point,
+    c: ?*const ?Point,
+    d: []const ?*const ?Point,
+  };
+
+  const p1: Point = .{ .x = 1, .y = 1 };
+  const p2: ?Point = .{ .x = 2, .y = 2 };
+  const p3: ?Point = null;
+
+  const value = PointerAbuse{
+    .a = &p1,
+    .b = &p2,
+    .c = &p2,
+    .d = &.{ &p2, null, &p3 },
+  };
+
+  try testSerialization(value);
+}
+
+// test "recursive type serialization" {
+//   const Node = struct {
+//     payload: u32,
+//     next: ?*const @This(),
+//   };
+//
+//   const n4 = Node{ .payload = 4, .next = undefined };
+//   const n3 = Node{ .payload = 3, .next = &n4 };
+//   const n2 = Node{ .payload = 2, .next = &n3 };
+//   const n1 = Node{ .payload = 1, .next = &n2 };
+//
+//   try _testSerializationDeserialization(n1, .{ .T = Node, .flatten_self_references = 4 });
+// }
 
