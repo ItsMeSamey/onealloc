@@ -49,6 +49,44 @@ pub fn GetShrunkEnumType(T: type, serialization: SerializationType) type {
   });
 }
 
+/// Returns true is parent contains child exactly 1 inderictions away
+/// i.e. exactly one pointer dereference (/ slice access) is needed to go from parent to child
+///
+/// this may return `true` yet ContainsT may return false and vice versa
+pub fn ContainsIndirectedT(parent: type, child: type) bool {
+  if (parent == child) return false;
+  return switch (@typeInfo(parent)) {
+    .type, .void, .bool, .noreturn, .int, .float, .comptime_float, .comptime_int, .undefined, .null,
+    .@"enum", .error_set, .@"fn", .@"opaque", .frame, .@"anyframe", .enum_literal => false,
+    .pointer => |pi| ContainsT(pi.child, child),
+    .array => |ai| ContainsIndirectedT(ai.child, child),
+    .@"struct" => |si| inline for (si.fields) |f| if (ContainsIndirectedT(f.type, child)) return true,
+    .optional => |oi| ContainsIndirectedT(oi.child, child),
+    .error_union => |ei| ContainsIndirectedT(ei.error_set, child) or ContainsIndirectedT(ei.payload, child),
+    .@"union" => |ui| inline for (ui.fields) |f| if (ContainsIndirectedT(f.type, child)) return true,
+    .vector => |vi| ContainsIndirectedT(vi.child, child),
+  };
+}
+
+/// Returns true if parent and child are equivalent
+/// i.e. they are both equal or parent contains child 0 indirections away
+///
+/// 0 inderictions away means no pointer dereference (/ slice access) is needed to go from parent to child
+fn ContainsT(parent: type, child: type) bool {
+  if (parent == child) return true;
+  return switch (@typeInfo(parent)) {
+    .type, .void, .bool, .noreturn, .int, .float, .comptime_float, .comptime_int, .undefined, .null,
+    .@"enum", .error_set, .@"fn", .@"opaque", .frame, .@"anyframe", .enum_literal => false,
+    .pointer => false, // Needs dereference
+    .array => |ai| ContainsT(ai.child, child),
+    .@"struct" => |si| inline for (si.fields) |f| if (ContainsT(f.type, child)) return true,
+    .optional => |oi| ContainsT(oi.child, child),
+    .error_union => |ei| ContainsT(ei.error_set, child) or ContainsT(ei.payload, child),
+    .@"union" => |ui| inline for (ui.fields) |f| if (ContainsT(f.type, child)) return true,
+    .vector => |vi| ContainsT(vi.child, child),
+  };
+}
+
 // ========================================
 //                 Testing                 
 // ========================================
