@@ -9,7 +9,7 @@ const native_endian = builtin.cpu.arch.endian();
 pub const ToMergedOptions = struct {
   /// The type that is to be merged
   T: type,
-  /// Recurse into structs and unions 
+  /// Recurse into structs and unions
   recurse: comptime_int = 1024,
   /// Error if recurse = 0
   error_on_0_recurse: bool = true,
@@ -80,7 +80,7 @@ const Context = struct {
       .times_left = if (at == .none) self.times_left else switch (self.options.recursive_rereferencing) {
         .disallow => blk: {
           if (at == .sub) {
-            @compileError("Recursive re-referencing is disallowed for type " ++ @typeName(T) ++ " as it is not on the top level"); 
+            @compileError("Recursive re-referencing is disallowed for type " ++ @typeName(T) ++ " as it is not on the top level");
           } else break :blk self.times_left;
         },
         .top_only => if (at == .top) self.times_left - 1 else self.times_left,
@@ -133,7 +133,12 @@ pub fn Bytes(comptime _alignment: std.mem.Alignment) type {
       return .{ .ptr = v.ptr, ._len = if (builtin.mode == .Debug) v.len else {} };
     }
 
-    pub fn from(self: @This(), index: usize) @This() {
+    pub fn initAssert(v: []u8) @This() {
+      std.debug.assert(std.mem.isAligned(@intFromPtr(v.ptr), _alignment.toByteUnits()));
+      return .{ .ptr = @alignCast(v.ptr), ._len = if (builtin.mode == .Debug) v.len else {} };
+    }
+
+    pub fn from(self: @This(), index: usize) Bytes(.@"1") {
       if (builtin.mode == .Debug and index > self._len) {
         std.debug.panic("Index {d} is out of bounds for slice of length {d}\n", .{ index, self._len });
       }
@@ -156,11 +161,11 @@ pub fn Bytes(comptime _alignment: std.mem.Alignment) type {
       return self.till(end_index).ptr[0..end_index];
     }
 
-    pub fn alignForward(self: @This(), comptime new_alignment: std.mem.Alignment) if (new_alignment == alignment) @This() else Bytes(new_alignment) {
-      const aligned_ptr = std.mem.alignForward(@TypeOf(self.ptr), self.ptr, new_alignment.toByteUnits());
+    pub fn alignForward(self: @This(), comptime new_alignment: std.mem.Alignment) if (new_alignment == _alignment) @This() else Bytes(new_alignment) {
+      const aligned_ptr = std.mem.alignForward(usize, @intFromPtr(self.ptr), new_alignment.toByteUnits());
       return .{
-        .ptr = aligned_ptr,
-        ._len = self._len - (@intFromPtr(aligned_ptr) - @intFromPtr(self.ptr)) // Underflow => user error
+        .ptr = @ptrFromInt(aligned_ptr),
+        ._len = self._len - (aligned_ptr - @intFromPtr(self.ptr)) // Underflow => user error
       };
     }
 
@@ -184,18 +189,17 @@ pub fn GetDirectMergedT(T: type, context: Context) type {
     };
 
     pub fn write(val: *const T, static: S, _: Signature.D) usize {
-      if (@bitSizeOf(T) != 0) @memcpy(static.slice(Signature.static_size), std.mem.asBytes(val.*));
+      if (@bitSizeOf(T) != 0) @memcpy(static.slice(Signature.static_size), std.mem.asBytes(val));
       return 0;
     }
   };
 }
 
 /// Convert a supplid pointer type to writable opaque
-pub fn GetOnePointerMergedT(T: type, context: Context) !type {
+pub fn GetOnePointerMergedT(T: type, context: Context) type {
   if (context.options.dereference == 0) {
     if (context.options.error_on_0_dereference) {
-      @compileLog("Cannot dereference type " ++ @typeName(T) ++ " any further as options.dereference is 0");
-      return error.ErrorOn0Dereference;
+      @compileError("Cannot dereference type " ++ @typeName(T) ++ " any further as options.dereference is 0");
     } else {
       return GetDirectMergedT(T, context);
     }
@@ -209,9 +213,9 @@ pub fn GetOnePointerMergedT(T: type, context: Context) !type {
   next_options.dereference -= 1;
   const next_context = context.reop(next_options).see(T);
   if (next_context.times_left == -1) return GetDirectMergedT(T, context);
-  
+
   const Pointer = GetDirectMergedT(T, context);
-  const Child = try ToMergedT(pi.child, next_context.realign(pi.alignment));
+  const Child = ToMergedT(pi.child, next_context.realign(.fromByteUnits(pi.alignment)));
 
   return opaque {
     const S = Bytes(Signature.alignment);
@@ -223,27 +227,28 @@ pub fn GetOnePointerMergedT(T: type, context: Context) !type {
     };
 
     pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
-      std.debug.assert(std.mem.isAligned(static.ptr, Pointer.Signature.alignment.toByteUnits()));
-      std.debug.assert(std.mem.isAligned(dynamic.ptr, Signature.D.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Pointer.Signature.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(@intFromPtr(dynamic.ptr), Signature.D.alignment));
 
       // TODO: Add a function to fix portability issues with pointers
-      Pointer.write(&dynamic.ptr, static, undefined);
-      if (is_optional and val.* == null) return 0;
+      if (is_optional and val.* == null) return Pointer.write(&@as(T, null), static, undefined);
+      const dptr: T = @ptrFromInt(@intFromPtr(dynamic.ptr));
+      std.debug.assert(0 == Pointer.write(&dptr, static, undefined));
 
       const child_static = dynamic.till(Child.Signature.static_size);
       const child_dynamic = dynamic.from(Child.Signature.static_size);
-      const written = Child.write(if (is_optional) val.*.? else val.*, child_static, child_dynamic.alignForward(Child.Signature.D.alignment));
+      const written = Child.write(if (is_optional) val.*.? else val.*, child_static, child_dynamic.alignForward(.fromByteUnits(Child.Signature.D.alignment)));
 
       return Child.Signature.static_size + written;
     }
 
     pub fn getDynamicSize(val: *const T, size: usize) usize {
-      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment));
       if (is_optional and val.* == null) return size;
 
       var new_size = size + Child.Signature.static_size;
       if (std.meta.hasFn(Child, "getDynamicSize")) {
-        new_size = std.mem.alignForward(usize, new_size, Child.Signature.D.alignment.toByteUnits());
+        new_size = std.mem.alignForward(usize, new_size, Child.Signature.D.alignment);
         new_size = Child.getDynamicSize(if (is_optional) val.*.? else val.*, new_size);
       }
 
@@ -252,11 +257,10 @@ pub fn GetOnePointerMergedT(T: type, context: Context) !type {
   };
 }
 
-pub fn GetSliceMergedT(T: type, context: Context) !type {
+pub fn GetSliceMergedT(T: type, context: Context) type {
   if (context.options.deslice == 0) {
     if (context.options.error_on_0_deslice) {
-      @compileLog("Cannot deslice type " ++ @typeName(T) ++ " any further as options.deslice is 0");
-      return error.ErrorOn0Deslice;
+      @compileError("Cannot deslice type " ++ @typeName(T) ++ " any further as options.deslice is 0");
     }
     return GetDirectMergedT(T, context);
   }
@@ -270,7 +274,7 @@ pub fn GetSliceMergedT(T: type, context: Context) !type {
   if (next_context.times_left == -1) return GetDirectMergedT(T, context);
 
   const Slice = GetDirectMergedT(T, context);
-  const Child = try ToMergedT(pi.child, next_context.realign(.fromByteUnits(pi.alignment)));
+  const Child = ToMergedT(pi.child, next_context.realign(.fromByteUnits(pi.alignment)));
   const SubStatic = !std.meta.hasFn(Child, "getDynamicSize");
 
   return opaque {
@@ -284,7 +288,7 @@ pub fn GetSliceMergedT(T: type, context: Context) !type {
 
     pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
       std.debug.assert(std.mem.isAligned(static.ptr, Signature.alignment.toByteUnits()));
-      std.debug.assert(std.mem.isAligned(dynamic.ptr, Signature.D.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(dynamic.ptr, Signature.D.alignment));
 
       var header_to_write = val.*;
       header_to_write.ptr = @ptrCast(dynamic.ptr);
@@ -307,12 +311,12 @@ pub fn GetSliceMergedT(T: type, context: Context) !type {
     }
 
     pub fn getDynamicSize(val: *const T, size: usize) usize {
-      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment));
       var new_size = size + Child.Signature.static_size * val.*.len;
 
       if (!SubStatic) {
         for (val.*) |*item| {
-          new_size = std.mem.alignForward(usize, new_size, Child.Signature.D.alignment.toByteUnits());
+          new_size = std.mem.alignForward(usize, new_size, Child.Signature.D.alignment);
           new_size = Child.getDynamicSize(item, new_size);
         }
       }
@@ -322,11 +326,11 @@ pub fn GetSliceMergedT(T: type, context: Context) !type {
   };
 }
 
-pub fn GetArrayMergedT(T: type, context: Context) !type {
+pub fn GetArrayMergedT(T: type, context: Context) type {
   @setEvalBranchQuota(1000_000);
   const ai = @typeInfo(T).array;
   // No need to .see(T) here as the child will handle this anyway and if the array type is repeated, the child will be too.
-  const Child = try ToMergedT(ai.child, context.realign(null));
+  const Child = ToMergedT(ai.child, context.realign(null));
 
   // If the child has no dynamic data, the entire array is static.
   // We can treat it as a direct memory copy.
@@ -344,8 +348,8 @@ pub fn GetArrayMergedT(T: type, context: Context) !type {
 
     pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
       std.debug.assert(std.mem.isAligned(static.ptr, Signature.alignment.toByteUnits()));
-      std.debug.assert(std.mem.isAligned(dynamic.ptr, Signature.D.alignment.toByteUnits()));
-      
+      std.debug.assert(std.mem.isAligned(dynamic.ptr, Signature.D.alignment));
+
       var child_static = static.till(Signature.static_size);
       var child_dynamic = dynamic;
 
@@ -360,10 +364,10 @@ pub fn GetArrayMergedT(T: type, context: Context) !type {
     }
 
     pub fn getDynamicSize(val: *const T, size: usize) usize {
-      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment));
       var new_size = size;
       inline for (0..ai.len) |i| {
-        new_size = std.mem.alignForward(usize, new_size, Child.Signature.D.alignment.toByteUnits());
+        new_size = std.mem.alignForward(usize, new_size, Child.Signature.D.alignment);
         new_size = Child.getDynamicSize(&val[i], new_size);
       }
       return new_size;
@@ -371,12 +375,11 @@ pub fn GetArrayMergedT(T: type, context: Context) !type {
   };
 }
 
-pub fn GetStructMergedT(T: type, context: Context) !type {
+pub fn GetStructMergedT(T: type, context: Context) type {
   @setEvalBranchQuota(1000_000);
   if (context.options.recurse == 0) {
     if (context.options.error_on_0_recurse) {
-      @compileLog("Cannot recurse into type " ++ @typeName(T) ++ " any further as options.recurse is 0");
-      return error.ErrorOn0Recurse;
+      @compileError("Cannot recurse into type " ++ @typeName(T) ++ " any further as options.recurse is 0");
     }
     return GetDirectMergedT(T, context);
   }
@@ -397,7 +400,7 @@ pub fn GetStructMergedT(T: type, context: Context) !type {
     var pfields: [si.fields.len]ProcessedField = undefined;
 
     for (si.fields, 0..) |f, i| {
-      const MergedChild = try ToMergedT(f.type, next_context.realign(.fromByteUnits(f.alignment)));
+      const MergedChild = ToMergedT(f.type, next_context.realign(.fromByteUnits(f.alignment)));
       pfields[i] = .{
         .original = f,
         .merged = MergedChild,
@@ -424,13 +427,13 @@ pub fn GetStructMergedT(T: type, context: Context) !type {
     };
 
     pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
-      std.debug.assert(std.mem.isAligned(static.ptr, Signature.alignment.toByteUnits()));
-      std.debug.assert(std.mem.isAligned(dynamic.ptr, Signature.D.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Signature.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(@intFromPtr(dynamic.ptr), Signature.D.alignment));
 
       var dynamic_offset: usize = 0;
       inline for (fields) |f| {
-        std.debug.assert(std.mem.isAligned(static.from(f.static_offset).ptr, f.merged.Signature.alignment.toByteUnits()));
-        // alignForward here used only to correct the type, alignment is already correct, hence the assertion above
+        std.debug.assert(std.mem.isAligned(@intFromPtr(static.from(f.static_offset).ptr), f.merged.Signature.alignment.toByteUnits()));
+        // alignForward here used only to coerce the type, alignment is already correct, hence the assertion above
         const child_static = static.from(f.static_offset).alignForward(f.merged.Signature.alignment);
 
         if (!std.meta.hasFn(f.merged, "getDynamicSize")) {
@@ -448,12 +451,12 @@ pub fn GetStructMergedT(T: type, context: Context) !type {
     }
 
     pub fn getDynamicSize(val: *const T, size: usize) usize {
-      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment));
       var new_size: usize = size;
 
       inline for (fields) |f| {
         if (!std.meta.hasFn(f.merged, "getDynamicSize")) continue;
-        new_size = std.mem.alignForward(usize, new_size, f.merged.Signature.D.alignment.toByteUnits());
+        new_size = std.mem.alignForward(usize, new_size, f.merged.Signature.D.alignment);
         new_size = f.merged.getDynamicSize(&@field(val.*, f.original.name), new_size);
       }
 
@@ -462,13 +465,13 @@ pub fn GetStructMergedT(T: type, context: Context) !type {
   };
 }
 
-pub fn GetOptionalMergedT(T: type, context: Context) !type {
+pub fn GetOptionalMergedT(T: type, context: Context) type {
   const oi = @typeInfo(T).optional;
   if (@typeInfo(oi.child) == .pointer) return GetOnePointerMergedT(T, context);
 
-  const Child = try ToMergedT(oi.child, context);
+  const Child = ToMergedT(oi.child, context);
   if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(T, context);
-  const Tag = try ToMergedT(bool, context);
+  const Tag = ToMergedT(bool, context);
 
   const alignment = context.align_hint orelse .fromByteUnits(@alignOf(T));
   return opaque {
@@ -507,15 +510,15 @@ pub fn GetOptionalMergedT(T: type, context: Context) !type {
   };
 }
 
-pub fn GetErrorUnionMergedT(T: type, context: Context) !type {
+pub fn GetErrorUnionMergedT(T: type, context: Context) type {
   const ei = @typeInfo(T).error_union;
   const Payload = ei.payload;
   const ErrorSet = ei.error_set;
   const ErrorInt = std.meta.Int(.unsigned, @bitSizeOf(ErrorSet));
 
-  const Child = try ToMergedT(Payload, context);
+  const Child = ToMergedT(Payload, context);
   if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(T, context);
-  const Err = try ToMergedT(ErrorInt, context);
+  const Err = ToMergedT(ErrorInt, context);
 
   const ErrSize = Err.Signature.static_size;
   const PayloadSize = Child.Signature.static_size;
@@ -545,7 +548,7 @@ pub fn GetErrorUnionMergedT(T: type, context: Context) !type {
         const written = Child.write(payload_val, payload_buffer, aligned_dynamic);
         return written + @intFromPtr(aligned_dynamic.ptr) - @intFromPtr(dynamic.ptr);
       } else |err| {
-        const error_int: ErrorInt = @intFromEnum(err);
+        const error_int: ErrorInt = @intFromError(err);
         std.debug.assert(0 == Err.write(&error_int, error_buffer, undefined));
         return 0;
       }
@@ -553,7 +556,7 @@ pub fn GetErrorUnionMergedT(T: type, context: Context) !type {
 
     pub fn getDynamicSize(val: *const T, size: usize) usize {
       if (val.*) |*payload_val| {
-        const new_size = size.alignForward(Child.Signature.D.alignment.toByteUnits());
+        const new_size = size.alignForward(Child.Signature.D.alignment);
         return Child.getDynamicSize(payload_val, new_size);
       } else {
         return size;
@@ -562,19 +565,17 @@ pub fn GetErrorUnionMergedT(T: type, context: Context) !type {
   };
 }
 
-pub fn GetUnionMergedT(T: type, context: Context) !type {
+pub fn GetUnionMergedT(T: type, context: Context) type {
   if (context.options.recurse == 0) {
     if (context.options.error_on_0_recurse) {
-      @compileLog("Cannot recurse into type " ++ @typeName(T) ++ " any further as options.recurse is 0");
-      return error.ErrorOn0Recurse;
+      @compileError("Cannot recurse into type " ++ @typeName(T) ++ " any further as options.recurse is 0");
     }
     return GetDirectMergedT(T, context);
   }
 
   const ui = @typeInfo(T).@"union";
   if (ui.tag_type == null) {
-    @compileLog("Cannot merge untagged union " ++ @typeName(T));
-    return error.UntaggedUnion;
+    @compileError("Cannot merge untagged union " ++ @typeName(T));
   }
 
   var next_options = context.options;
@@ -595,7 +596,7 @@ pub fn GetUnionMergedT(T: type, context: Context) !type {
       }
       pfields[i] = .{
         .original = f,
-        .merged = try ToMergedT(f.type, next_context.realign(f.alignment)),
+        .merged = ToMergedT(f.type, next_context.realign(f.alignment)),
       };
     }
     break :blk pfields;
@@ -610,7 +611,7 @@ pub fn GetUnionMergedT(T: type, context: Context) !type {
     break :blk true;
   }) return GetDirectMergedT(T, context);
 
-  const Tag = try ToMergedT(ui.tag_type.?, context.realign(null));
+  const Tag = ToMergedT(ui.tag_type.?, context.realign(null));
   const max_child_static_size = blk: {
     var max_size: usize = 0;
     for (fields) |f| max_size = @max(max_size, f.merged.Signature.static_size);
@@ -654,7 +655,7 @@ pub fn GetUnionMergedT(T: type, context: Context) !type {
           if (!std.meta.hasFn(f.merged, "getDynamicSize")) {
             return f.merged.write(&@field(val.*, f.original.name), child_static, undefined);
           } else {
-            const aligned_dynamic = dynamic.alignForward(f.merged.Signature.D.alignment.toByteUnits());
+            const aligned_dynamic = dynamic.alignForward(f.merged.Signature.D.alignment);
             const written = f.merged.write(&@field(val.*, f.original.name), child_static, aligned_dynamic);
             return written + @intFromPtr(aligned_dynamic.ptr) - @intFromPtr(dynamic.ptr);
           }
@@ -664,14 +665,14 @@ pub fn GetUnionMergedT(T: type, context: Context) !type {
     }
 
     pub fn getDynamicSize(val: *const T, size: usize) usize {
-      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment));
       const active_tag = std.meta.activeTag(val.*);
-      
+
       inline for (fields) |f| {
         const field_as_tag = comptime std.meta.stringToEnum(ui.tag_type.?, f.original.name);
         if (field_as_tag == active_tag) {
           if (!std.meta.hasFn(f.merged, "getDynamicSize")) return size;
-          const new_size = size.alignForward(f.merged.Signature.D.alignment.toByteUnits());
+          const new_size = std.mem.alignForward(usize, size, f.merged.Signature.D.alignment);
           return f.merged.getDynamicSize(&@field(val.*, f.original.name), new_size);
         }
       }
@@ -680,18 +681,16 @@ pub fn GetUnionMergedT(T: type, context: Context) !type {
   };
 }
 
-pub fn ToMergedT(T: type, context: Context) !type {
+pub fn ToMergedT(T: type, context: Context) type {
   @setEvalBranchQuota(1000_000);
   return switch (@typeInfo(T)) {
-    .type, .noreturn, .comptime_int, .comptime_float, .undefined, .@"fn", .frame, .@"anyframe", .enum_literal => blk: {
-      @compileLog("Type '" ++ @tagName(std.meta.activeTag(@typeInfo(T))) ++ "' is not mergeable\n");
-      break :blk error.NonMergeableType;
+    .type, .noreturn, .comptime_int, .comptime_float, .undefined, .@"fn", .frame, .@"anyframe", .enum_literal => {
+      @compileError("Type '" ++ @tagName(std.meta.activeTag(@typeInfo(T))) ++ "' is not mergeable\n");
     },
     .void, .bool, .int, .float, .vector, .error_set, .null => GetDirectMergedT(T, context),
     .pointer => |pi| switch (pi.size) {
-      .many, .c => if (context.options.serialize_unknown_pointer_as_usize) GetDirectMergedT(T, context) else blk: {
-        @compileLog(@tagName(pi.size) ++ " pointer cannot be serialized for type " ++ @typeName(T) ++ ", consider setting serialize_many_pointer_as_usize to true\n");
-        break :blk error.NonMergeablePointerType;
+      .many, .c => if (context.options.serialize_unknown_pointer_as_usize) GetDirectMergedT(T, context) else {
+        @compileError(@tagName(pi.size) ++ " pointer cannot be serialized for type " ++ @typeName(T) ++ ", consider setting serialize_many_pointer_as_usize to true\n");
       },
       .one => GetOnePointerMergedT(T, context),
       .slice => GetSliceMergedT(T, context),
@@ -702,9 +701,8 @@ pub fn ToMergedT(T: type, context: Context) !type {
     .error_union => GetErrorUnionMergedT(T, context),
     .@"enum" => GetDirectMergedT(T, context),
     .@"union" => GetUnionMergedT(T, context),
-    .@"opaque" => if (@hasDecl(T, "Signature") and @hasField(T.Signature, "T") and @FieldType(T.Signature, "T") == type) T else blk: {
-      @compileLog("A non-mergeable opaque " ++ @typeName(T) ++ " was provided to `ToMergedT`\n");
-      break :blk error.NonMergeableOpaque;
+    .@"opaque" => if (@hasDecl(T, "Signature") and @hasField(T.Signature, "T") and @FieldType(T.Signature, "T") == type) T else {
+      @compileError("A non-mergeable opaque " ++ @typeName(T) ++ " was provided to `ToMergedT`\n");
     },
   };
 }
