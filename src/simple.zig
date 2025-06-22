@@ -694,27 +694,20 @@ const expectEqual = @import("testing.zig").expectEqual;
 
 fn _testMergingDemerging(value: anytype, comptime options: ToMergedOptions) !void {
   const MergedT = ToMergedT(.init(options));
-
   const static_size = MergedT.Signature.static_size;
-  var static_buffer: [static_size]u8 = undefined;
+  var buffer: [static_size + 4096]u8 = undefined;
 
-  const dynamic_size = if (std.meta.hasFn(MergedT, "getDynamicSize")) MergedT.getDynamicSize(&value, 0) else 0;
-  var dynamic_buffer: [4096]u8 = undefined;
-  if (dynamic_size > dynamic_buffer.len) {
-    std.log.err("dynamic buffer too small for test. need {d}, have {d}", .{ dynamic_size, dynamic_buffer.len });
+  const total_size = if (std.meta.hasFn(MergedT, "getDynamicSize")) MergedT.getDynamicSize(&value, static_size) else static_size;
+  if (total_size > buffer.len) {
+    std.log.err("buffer too small for test. need {d}, have {d}", .{ total_size, buffer.len });
     return error.NoSpaceLeft;
   }
 
-  const written_dynamic_size = MergedT.write(&value, .initAssert(&static_buffer), .initAssert(&dynamic_buffer));
+  const dynamic_from = std.mem.alignForward(usize, static_size, MergedT.Signature.D.alignment);
+  const written_dynamic_size = MergedT.write(&value, .initAssert(buffer[0..static_size]), .initAssert(buffer[dynamic_from..]));
+  try std.testing.expectEqual(total_size - dynamic_from, written_dynamic_size);
 
-  if (std.meta.hasFn(@TypeOf(value), "PRINT")) {
-    std.debug.print("static: {d}, dynamic: {s}\n", .{ static_buffer[0..MergedT.Signature.static_size], dynamic_buffer[0..written_dynamic_size] });
-    std.debug.print("value: {any}\n", .{value});
-    std.debug.print("merged: {any}\n", .{@as(*@TypeOf(value), @ptrCast(@alignCast(&static_buffer)))});
-  }
-
-  try std.testing.expectEqual(dynamic_size, written_dynamic_size);
-  try expectEqual(&value, @as(*@TypeOf(value), @ptrFromInt(@intFromPtr(&static_buffer))));
+  try expectEqual(&value, @as(*@TypeOf(value), @ptrFromInt(@intFromPtr(&buffer))));
 }
 
 fn testMerging(value: anytype) !void {
