@@ -1353,16 +1353,13 @@ test "Wrapper clone" {
   var wrapped2 = try wrapped1.clone(testing.allocator);
   defer wrapped2.deinit(testing.allocator);
 
-  // Ensure they are not the same memory block
   try testing.expect(wrapped1.memory.ptr != wrapped2.memory.ptr);
 
-  // Ensure the content is identical
   const d1 = wrapped1.get();
   const d2 = wrapped2.get();
   try expectEqual(d1.id, d2.id);
   try std.testing.expectEqualSlices(u32, d1.items, d2.items);
 
-  // Modify the original and ensure the clone is unaffected
   wrapped1.get().id = 99;
   try expectEqual(@as(u32, 99), wrapped1.get().id);
   try expectEqual(@as(u32, 1), wrapped2.get().id);
