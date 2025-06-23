@@ -177,7 +177,7 @@ pub fn GetOnePointerMergedT(context: Context) type {
   const T = context.options.T;
   if (!context.options.dereference) return GetDirectMergedT(context);
 
-  const is_optional = if (@typeInfo(T) == .optional) true else false;
+  const is_optional = @typeInfo(T) == .optional;
   const pi = @typeInfo(if (is_optional) @typeInfo(T).optional.child else T).pointer;
   std.debug.assert(pi.size == .one);
 
@@ -269,7 +269,8 @@ pub fn GetSliceMergedT(context: Context) type {
     return GetDirectMergedT(context);
   }
 
-  const pi = @typeInfo(T).pointer;
+  const is_optional = @typeInfo(T) == .optional;
+  const pi = @typeInfo(if (is_optional) @typeInfo(T).optional.child else T).pointer;
   std.debug.assert(pi.size == .slice);
   const Slice = GetDirectMergedT(context);
 
@@ -285,26 +286,29 @@ pub fn GetSliceMergedT(context: Context) type {
     const S = Bytes(Signature.alignment);
     pub const Signature = MergedSignature{
       .T = T,
-      .D = Bytes(Child.Signature.alignment),
+      .D = Bytes(if (is_optional) .@"1" else Child.Signature.alignment),
       .static_size = Slice.Signature.static_size,
       .alignment = Slice.Signature.alignment,
     };
 
-    pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
+    pub fn write(val: *const T, static: S, _dynamic: Signature.D) usize {
       std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Signature.alignment.toByteUnits()));
-      std.debug.assert(std.mem.isAligned(@intFromPtr(dynamic.ptr), Signature.D.alignment));
+      std.debug.assert(std.mem.isAligned(@intFromPtr(_dynamic.ptr), Signature.D.alignment));
+      const dynamic = if (is_optional) _dynamic.alignForward(Child.Signature.alignment) else _dynamic;
 
       var header_to_write = val.*;
-      header_to_write.ptr = @ptrCast(dynamic.ptr);
+      if (!is_optional or val.* != null) header_to_write.ptr = @ptrCast(dynamic.ptr);
       std.debug.assert(0 == Slice.write(&header_to_write, static, undefined));
+      if (is_optional and val.* == null) return 0;
+      const slice = if (is_optional) val.*.? else val.*;
 
-      const len = val.*.len;
+      const len = slice.len;
       if (Child.Signature.static_size == 0 or len == 0) return 0;
 
       var child_static = dynamic.till(Child.Signature.static_size * len);
       var child_dynamic = dynamic.from(Child.Signature.static_size * len).alignForward(.fromByteUnits(Child.Signature.D.alignment));
 
-      for (val.*) |*item| {
+      for (slice) |*item| {
         if (!SubStatic) child_dynamic = child_dynamic.alignForward(.fromByteUnits(Child.Signature.D.alignment));
         const written = Child.write(item, child_static, if (SubStatic) undefined else child_dynamic);
 
@@ -316,16 +320,18 @@ pub fn GetSliceMergedT(context: Context) type {
         if (!SubStatic) child_dynamic = child_dynamic.from(written);
       }
 
-      return @intFromPtr(child_dynamic.ptr) - @intFromPtr(dynamic.ptr);
+      return @intFromPtr(child_dynamic.ptr) - @intFromPtr(_dynamic.ptr);
     }
 
     pub const getDynamicSize = if (Child.Signature.static_size == 0) void else _getDynamicSize;
     fn _getDynamicSize(val: *const T, size: usize) usize {
       std.debug.assert(std.mem.isAligned(size, Signature.D.alignment));
-      var new_size = size + Child.Signature.static_size * val.*.len;
+      if (is_optional and val.* == null) return size;
+      const slice = if (is_optional) val.*.? else val.*;
+      var new_size = size + Child.Signature.static_size * slice.len;
 
       if (!SubStatic) {
-        for (val.*) |*item| {
+        for (slice) |*item| {
           new_size = std.mem.alignForward(usize, new_size, Child.Signature.D.alignment);
           new_size = Child.getDynamicSize(item, new_size);
         }
@@ -334,11 +340,13 @@ pub fn GetSliceMergedT(context: Context) type {
       return new_size;
     }
 
-    pub fn repointer(static: S, dynamic: Signature.D) usize {
+    pub fn repointer(static: S, _dynamic: Signature.D) usize {
       std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Signature.alignment.toByteUnits()));
-      std.debug.assert(std.mem.isAligned(@intFromPtr(dynamic.ptr), Signature.D.alignment));
+      std.debug.assert(std.mem.isAligned(@intFromPtr(_dynamic.ptr), Signature.D.alignment));
+      const dynamic = if (is_optional) _dynamic.alignForward(Child.Signature.alignment) else _dynamic;
 
-      const header = @as(*T, static.ptr);
+      const header: *T = @ptrCast(static.ptr);
+      if (is_optional and header.* == null) return 0;
       header.*.ptr = @ptrCast(dynamic.ptr);
       const len = header.*.len;
 
@@ -360,7 +368,7 @@ pub fn GetSliceMergedT(context: Context) type {
         child_dynamic = child_dynamic.from(written);
       }
 
-      return @intFromPtr(child_dynamic.ptr) - @intFromPtr(dynamic.ptr);
+      return @intFromPtr(child_dynamic.ptr) - @intFromPtr(_dynamic.ptr);
     }
   };
 
@@ -564,13 +572,11 @@ pub fn GetStructMergedT(context: Context) type {
 pub fn GetOptionalMergedT(context: Context) type {
   const T = context.options.T;
   const oi = @typeInfo(T).optional;
-  if (@typeInfo(oi.child) == .pointer) return GetOnePointerMergedT(context);
-
   const Child = ToMergedT(context.T(oi.child));
   if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(context);
 
   if (context.options.error_on_unsafe_conversion) {
-    @compileError("Cannot merge unsafe union type " ++ @typeName(T));
+    @compileError("Cannot merge unsafe optional type " ++ @typeName(T));
   }
 
   const Tag = ToMergedT(context.T(bool));
@@ -645,7 +651,7 @@ pub fn GetErrorUnionMergedT(context: Context) type {
   if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(context);
 
   if (context.options.error_on_unsafe_conversion) {
-    @compileError("Cannot merge unsafe union type " ++ @typeName(T));
+    @compileError("Cannot merge unsafe error union type " ++ @typeName(T));
   }
 
   const Err = ToMergedT(context.T(ErrorInt));
@@ -883,8 +889,8 @@ pub fn ToMergedT(context: Context) type {
         @compileError(@tagName(pi.size) ++ " pointer cannot be serialized for type " ++ @typeName(T) ++ ", consider setting serialize_many_pointer_as_usize to true\n");
       },
       .one => switch (@typeInfo(pi.child)) {
-        .@"opaque" => if (@hasDecl(T, "Signature") and @hasField(T.Signature, "T") and @FieldType(T.Signature, "T") == type) T else {
-          @compileError("A non-mergeable opaque " ++ @typeName(T) ++ " was provided to `ToMergedT`\n");
+        .@"opaque" => if (@hasDecl(pi.child, "Signature") and @hasField(pi.child.Signature, "T") and @FieldType(pi.child.Signature, "T") == type) T else {
+          @compileError("A non-mergeable opaque " ++ @typeName(pi.child) ++ " was provided to `ToMergedT`\n");
         },
         else => GetOnePointerMergedT(context),
       },
@@ -892,7 +898,16 @@ pub fn ToMergedT(context: Context) type {
     },
     .array => GetArrayMergedT(context),
     .@"struct" => GetStructMergedT(context),
-    .optional => GetOptionalMergedT(context),
+    .optional => |oi| switch (@typeInfo(oi.child)) {
+      .pointer => |pi| switch (pi.size) {
+        .many, .c => if (context.options.serialize_unknown_pointer_as_usize) GetDirectMergedT(context) else {
+          @compileError(@tagName(pi.size) ++ " pointer cannot be serialized for type " ++ @typeName(T) ++ ", consider setting serialize_many_pointer_as_usize to true\n");
+        },
+        .one => GetOnePointerMergedT(context),
+        .slice => GetSliceMergedT(context),
+      },
+      else => GetOptionalMergedT(context),
+    },
     .error_union => GetErrorUnionMergedT(context),
     .@"enum" => GetDirectMergedT(context),
     .@"union" => GetUnionMergedT(context),
@@ -1532,10 +1547,26 @@ pub fn WrapConverted(MergedT: type) type {
     /// Expects there to be no data cycles
     pub fn setAssert(self: *@This(), value: *const T) !void {
       if (builtin.mode == .Debug) { // debug.assert alone may does not be optimized out
-        std.debug.assert(getSize(value) < self.memory.len);
+        std.debug.assert(getSize(value) <= self.memory.len);
       }
       const dynamic_buffer = MergedT.Signature.D.init(self.memory[MergedT.Signature.static_size..]).alignForward(.fromByteUnits(MergedT.Signature.D.alignment));
       _ = MergedT.write(value, .initAssert(self.memory[0..MergedT.Signature.static_size]), dynamic_buffer);
+    }
+
+
+    /// Updates the internal pointers within the merged data structure. This is necessary
+    /// if the underlying `memory` buffer is moved (e.g., after a memcpy).
+    pub fn repointer(self: *@This()) void {
+      if (!std.meta.hasFn(MergedT, "getDynamicSize")) return; // Static data, no updation needed
+
+      const static_size = MergedT.Signature.static_size;
+      if (static_size == 0) return;
+
+      const dynamic_from = std.mem.alignForward(usize, static_size, MergedT.Signature.D.alignment);
+      _ = MergedT.repointer(
+        .initAssert(self.memory[0..static_size]), 
+        .initAssert(self.memory[dynamic_from..])
+      );
     }
   };
 }
@@ -1577,5 +1608,59 @@ test "Wrapper clone" {
   wrapped1.get().id = 99;
   try expectEqual(@as(u32, 99), wrapped1.get().id);
   try expectEqual(@as(u32, 1), wrapped2.get().id);
+}
+
+test "Wrapper set" {
+  const Data = struct { id: u32, items: []const u32 };
+  var wrapped = try Wrapper(.{ .T = Data }).init(testing.allocator, &.{ .id = 1, .items = &.{10} });
+  defer wrapped.deinit(testing.allocator);
+
+  // Set to a larger value
+  try wrapped.set(testing.allocator, &.{ .id = 2, .items = &.{ 20, 30, 40 } });
+  var d = wrapped.get();
+  try expectEqual(@as(u32, 2), d.id);
+  try std.testing.expectEqualSlices(u32, &.{ 20, 30, 40 }, d.items);
+  
+  // Set to a smaller value
+  try wrapped.set(testing.allocator, &.{ .id = 3, .items = &.{50} });
+  d = wrapped.get();
+  try expectEqual(@as(u32, 3), d.id);
+  try std.testing.expectEqualSlices(u32, &.{50}, d.items);
+}
+
+test "Wrapper repointer" {
+  const LogEntry = struct {
+    timestamp: u64,
+    message: []const u8,
+  };
+
+  var wrapped = try Wrapper(.{ .T = LogEntry }).init(
+    testing.allocator,
+    &.{ .timestamp = 12345, .message = "initial message" },
+  );
+  defer wrapped.deinit(testing.allocator);
+
+  // Manually move the memory to a new buffer (like reading from a file etc.)
+  const new_buffer = try testing.allocator.alignedAlloc(u8, @alignOf(@TypeOf(wrapped.memory)), wrapped.memory.len);
+  @memcpy(new_buffer, wrapped.memory);
+  
+  // free the old memory and update the wrapper's memory slice
+  testing.allocator.free(wrapped.memory);
+  wrapped.memory = new_buffer;
+
+  // internal pointers are now invalid
+  wrapped.repointer();
+
+  // Verify that data is correct and pointers are valid
+  const entry = wrapped.get();
+  try testing.expectEqual(@as(u64, 12345), entry.timestamp);
+  try testing.expectEqualSlices(u8, "initial message", entry.message);
+
+  // ensure the slice pointer points inside the *new* buffer
+  const memory_start = @intFromPtr(wrapped.memory.ptr);
+  const memory_end = memory_start + wrapped.memory.len;
+  const slice_start = @intFromPtr(entry.message.ptr);
+  const slice_end = slice_start + entry.message.len;
+  try testing.expect(slice_start >= memory_start and slice_end <= memory_end);
 }
 
