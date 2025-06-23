@@ -735,10 +735,7 @@ pub fn GetUnionMergedT(context: Context) type {
   if (!context.options.recurse) return GetDirectMergedT(context);
 
   const ui = @typeInfo(T).@"union";
-  if (ui.tag_type == null) {
-    @compileError("Cannot merge untagged union " ++ @typeName(T));
-  }
-
+  const TagType = ui.tag_type orelse std.meta.FieldEnum(T);
   const Retval = opaque {
     const next_context = context.see(T, @This());
 
@@ -761,7 +758,7 @@ pub fn GetUnionMergedT(context: Context) type {
       break :blk pfields;
     };
 
-    const Tag = ToMergedT(context.realign(null).T(ui.tag_type.?));
+    const Tag = ToMergedT(context.realign(null).T(TagType));
     const max_child_static_size = blk: {
       var max_size: usize = 0;
       for (fields) |f| max_size = @max(max_size, f.merged.Signature.static_size);
@@ -797,7 +794,7 @@ pub fn GetUnionMergedT(context: Context) type {
       // it had greater alignment and hence static data is aligned already
 
       inline for (fields) |f| {
-        const field_as_tag = comptime std.meta.stringToEnum(ui.tag_type.?, f.original.name);
+        const field_as_tag = comptime std.meta.stringToEnum(TagType, f.original.name);
         if (field_as_tag == active_tag) {
           const child_static = if (tag_first) static.from(max_child_static_size).assertAligned(f.merged.Signature.alignment)
             else static.till(f.merged.Signature.static_size).assertAligned(f.merged.Signature.alignment);
@@ -824,7 +821,7 @@ pub fn GetUnionMergedT(context: Context) type {
       const active_tag = std.meta.activeTag(val.*);
 
       inline for (fields) |f| {
-        const field_as_tag = comptime std.meta.stringToEnum(ui.tag_type.?, f.original.name);
+        const field_as_tag = comptime std.meta.stringToEnum(TagType, f.original.name);
         if (field_as_tag == active_tag) {
           if (!std.meta.hasFn(f.merged, "getDynamicSize")) return size;
           const new_size = std.mem.alignForward(usize, size, f.merged.Signature.D.alignment);
@@ -842,7 +839,7 @@ pub fn GetUnionMergedT(context: Context) type {
       // it had greater alignment and hence static data is aligned already
 
       inline for (fields) |f| {
-        const field_as_tag = comptime std.meta.stringToEnum(ui.tag_type.?, f.original.name);
+        const field_as_tag = comptime std.meta.stringToEnum(TagType, f.original.name);
         if (field_as_tag == active_tag) {
           const child_static = if (tag_first) static.from(max_child_static_size).assertAligned(f.merged.Signature.alignment)
             else static.till(f.merged.Signature.static_size).assertAligned(f.merged.Signature.alignment);
@@ -866,6 +863,7 @@ pub fn GetUnionMergedT(context: Context) type {
   };
 
   if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
+
   if (comptime blk: {
     for (Retval.fields) |f| {
       if (std.meta.hasFn(f.merged, "getDynamicSize")) {
@@ -874,6 +872,10 @@ pub fn GetUnionMergedT(context: Context) type {
     }
     break :blk true;
   }) return GetDirectMergedT(context);
+
+  if (ui.tag_type == null) {
+    @compileError("Cannot merge untagged union " ++ @typeName(T));
+  }
 
   if (context.options.error_on_unsafe_conversion) {
     @compileError("Cannot merge unsafe union type " ++ @typeName(T));
