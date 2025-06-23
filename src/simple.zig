@@ -199,7 +199,6 @@ pub fn GetOnePointerMergedT(context: Context) type {
       std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Pointer.Signature.alignment.toByteUnits()));
       std.debug.assert(std.mem.isAligned(@intFromPtr(_dynamic.ptr), Signature.D.alignment));
 
-      // TODO: Add a function to fix portability issues with pointers
       if (is_optional and val.* == null) return Pointer.write(&@as(T, null), static, undefined);
 
       const dynamic = if (is_optional) _dynamic.alignForward(Child.Signature.alignment) else _dynamic;
@@ -212,7 +211,7 @@ pub fn GetOnePointerMergedT(context: Context) type {
       const written = Child.write(if (is_optional) val.*.? else val.*, child_static, child_dynamic);
 
       if (std.meta.hasFn(Child, "getDynamicSize") and builtin.mode == .Debug) {
-        std.debug.assert(written == Child.getDynamicSize(if (is_optional) val.*.? else val.*, @intFromPtr(child_dynamic.ptr) - @intFromPtr(child_dynamic.ptr)));
+        std.debug.assert(written == Child.getDynamicSize(if (is_optional) val.*.? else val.*, @intFromPtr(child_dynamic.ptr)) - @intFromPtr(child_dynamic.ptr));
       }
       return written + @intFromPtr(child_dynamic.ptr) - @intFromPtr(_dynamic.ptr);
     }
@@ -232,6 +231,28 @@ pub fn GetOnePointerMergedT(context: Context) type {
       }
 
       return new_size;
+    }
+
+    pub fn repointer(static: S, _dynamic: Signature.D) usize {
+      std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Pointer.Signature.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(@intFromPtr(_dynamic.ptr), Signature.D.alignment));
+
+      if (is_optional and @as(*T, @ptrCast(static.ptr)).* == null) return 0;
+      const dynamic = if (is_optional) _dynamic.alignForward(Child.Signature.alignment) else _dynamic;
+      const dptr: T = @ptrCast(@alignCast(dynamic.ptr));
+      std.debug.assert(0 == Pointer.write(&dptr, static, undefined));
+      if (!std.meta.hasFn(Child, "repointer")) return 0;
+
+      const child_static = dynamic.till(Child.Signature.static_size);
+      // Align 1 if child is static, so no issue here, static and dynamic children an be written by same logic
+      const child_dynamic = dynamic.from(Child.Signature.static_size).alignForward(.fromByteUnits(Child.Signature.D.alignment));
+      const written = Child.repointer(child_static, child_dynamic);
+
+      if (std.meta.hasFn(Child, "getDynamicSize") and builtin.mode == .Debug) {
+        std.debug.assert(written == Child.getDynamicSize(@as(*T, @ptrCast(static.ptr)), @intFromPtr(child_dynamic.ptr)) - @intFromPtr(child_dynamic.ptr));
+      }
+
+      return written + @intFromPtr(child_dynamic.ptr) - @intFromPtr(_dynamic.ptr);
     }
   };
 
@@ -312,6 +333,35 @@ pub fn GetSliceMergedT(context: Context) type {
 
       return new_size;
     }
+
+    pub fn repointer(static: S, dynamic: Signature.D) usize {
+      std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Signature.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(@intFromPtr(dynamic.ptr), Signature.D.alignment));
+
+      const header = @as(*T, static.ptr);
+      header.*.ptr = @ptrCast(dynamic.ptr);
+      const len = header.*.len;
+
+      if (Child.Signature.static_size == 0 or len == 0) return 0;
+      if (SubStatic) return Child.Signature.static_size * len;
+
+      var child_static = dynamic.till(Child.Signature.static_size * len);
+      var child_dynamic = dynamic.from(Child.Signature.static_size * len).alignForward(.fromByteUnits(Child.Signature.D.alignment));
+
+      for (0..len) |i| {
+        child_dynamic = child_dynamic.alignForward(.fromByteUnits(Child.Signature.D.alignment));
+        const written = Child.repointer(child_static, child_dynamic);
+
+        if (builtin.mode == .Debug) {
+          std.debug.assert(written == Child.getDynamicSize(&header.*[i], @intFromPtr(child_dynamic.ptr) - @intFromPtr(child_dynamic.ptr)));
+        }
+
+        child_static = child_static.from(Child.Signature.static_size).assertAligned(Child.Signature.alignment);
+        child_dynamic = child_dynamic.from(written);
+      }
+
+      return @intFromPtr(child_dynamic.ptr) - @intFromPtr(dynamic.ptr);
+    }
   };
 
   if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
@@ -350,7 +400,7 @@ pub fn GetArrayMergedT(context: Context) type {
         child_dynamic = child_dynamic.alignForward(.fromByteUnits(Child.Signature.D.alignment));
         const written = Child.write(item, child_static, child_dynamic);
 
-        if (std.meta.hasFn(Child, "getDynamicSize") and builtin.mode == .Debug) {
+        if (builtin.mode == .Debug) {
           std.debug.assert(written == Child.getDynamicSize(item, @intFromPtr(child_dynamic.ptr)) - @intFromPtr(child_dynamic.ptr));
         }
 
@@ -369,6 +419,29 @@ pub fn GetArrayMergedT(context: Context) type {
         new_size = Child.getDynamicSize(&val[i], new_size);
       }
       return new_size;
+    }
+
+    pub fn repointer(static: S, dynamic: Signature.D) usize {
+      std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Signature.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(@intFromPtr(dynamic.ptr), Signature.D.alignment));
+
+      var child_static = static.till(Signature.static_size);
+      var child_dynamic = dynamic;
+
+      inline for (0..ai.len) |i| {
+        child_dynamic = child_dynamic.alignForward(.fromByteUnits(Child.Signature.D.alignment));
+        const written = Child.repointer(child_static, child_dynamic);
+
+        if (builtin.mode == .Debug) {
+          const val: *T = @ptrCast(static.ptr);
+          std.debug.assert(written == Child.getDynamicSize(&val[i], @intFromPtr(child_dynamic.ptr)) - @intFromPtr(child_dynamic.ptr));
+        }
+
+        child_static = child_static.from(Child.Signature.static_size).assertAligned(Child.Signature.alignment);
+        child_dynamic = child_dynamic.from(written);
+      }
+
+      return @intFromPtr(child_dynamic.ptr) - @intFromPtr(dynamic.ptr);
     }
   };
 }
@@ -393,10 +466,9 @@ pub fn GetStructMergedT(context: Context) type {
       var pfields: [si.fields.len]ProcessedField = undefined;
 
       for (si.fields, 0..) |f, i| {
-        const MergedChild = ToMergedT(next_context.realign(if (si.layout == .@"packed") .@"1" else .fromByteUnits(f.alignment)).T(f.type));
         pfields[i] = .{
           .original = f,
-          .merged = MergedChild,
+          .merged = ToMergedT(next_context.realign(if (si.layout == .@"packed") .@"1" else .fromByteUnits(f.alignment)).T(f.type)),
           .static_offset = @offsetOf(T, f.name),
         };
       }
@@ -455,6 +527,32 @@ pub fn GetStructMergedT(context: Context) type {
 
       return new_size;
     }
+
+    pub fn repointer(static: S, dynamic: Signature.D) usize {
+      std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Signature.alignment.toByteUnits()));
+      std.debug.assert(std.mem.isAligned(@intFromPtr(dynamic.ptr), Signature.D.alignment));
+
+      var dynamic_offset: usize = 0;
+      inline for (fields) |f| {
+        const child_static = static.from(f.static_offset).assertAligned(f.merged.Signature.alignment);
+
+        if (std.meta.hasFn(f.merged, "getDynamicSize")) {
+          const misaligned_dynamic = dynamic.from(dynamic_offset);
+          const aligned_dynamic = misaligned_dynamic.alignForward(.fromByteUnits(f.merged.Signature.D.alignment));
+          const written = f.merged.repointer(child_static, aligned_dynamic);
+
+          if (builtin.mode == .Debug) {
+            const val: *T = @ptrCast(static.ptr);
+            std.debug.assert(written == f.merged.getDynamicSize(&@field(val.*, f.original.name), @intFromPtr(aligned_dynamic.ptr)) - @intFromPtr(aligned_dynamic.ptr));
+          }
+
+          dynamic_offset += written + @intFromPtr(aligned_dynamic.ptr) - @intFromPtr(misaligned_dynamic.ptr);
+        }
+      }
+
+      return dynamic_offset;
+    }
+
   };
 
   if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
@@ -514,6 +612,23 @@ pub fn GetOptionalMergedT(context: Context) type {
         return Child.getDynamicSize(payload_val, new_size);
       } else {
         return size;
+      }
+    }
+
+    pub fn repointer(static: S, dynamic: Signature.D) usize {
+      std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Signature.alignment.toByteUnits()));
+      const child_static = static.till(Child.Signature.static_size);
+
+      const val: *T = @ptrCast(static.ptr);
+      if (val.*) |*payload_val| {
+        const aligned_dynamic = dynamic.alignForward(.fromByteUnits(Child.Signature.D.alignment));
+        const written = Child.repointer(child_static, aligned_dynamic);
+
+        if (builtin.mode == .Debug) {
+          std.debug.assert(written == Child.getDynamicSize(payload_val, @intFromPtr(aligned_dynamic.ptr)) - @intFromPtr(aligned_dynamic.ptr));
+        }
+
+        return written + @intFromPtr(aligned_dynamic.ptr) - @intFromPtr(dynamic.ptr);
       }
     }
   };
@@ -580,6 +695,24 @@ pub fn GetErrorUnionMergedT(context: Context) type {
         return Child.getDynamicSize(payload_val, new_size);
       } else {
         return size;
+      }
+    }
+
+    pub fn repointer(static: S, dynamic: Signature.D) usize {
+      std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Signature.alignment.toByteUnits()));
+
+      const payload_buffer = if (PayloadBeforeError) static.till(PayloadSize) else static.from(ErrSize);
+      const val: *T = @ptrCast(static.ptr);
+
+      if (val.*) |*payload_val| {
+        const aligned_dynamic = dynamic.alignForward(.fromByteUnits(Child.Signature.D.alignment));
+        const written = Child.repointer(payload_buffer, aligned_dynamic);
+
+        if (builtin.mode == .Debug) {
+          std.debug.assert(written == Child.getDynamicSize(payload_val, @intFromPtr(aligned_dynamic.ptr)) - @intFromPtr(aligned_dynamic.ptr));
+        }
+
+        return written + @intFromPtr(aligned_dynamic.ptr) - @intFromPtr(dynamic.ptr);
       }
     }
   };
@@ -687,6 +820,36 @@ pub fn GetUnionMergedT(context: Context) type {
         }
       }
       unreachable;
+    }
+
+    pub fn repointer(static: S, dynamic: Signature.D) usize {
+      std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Signature.alignment.toByteUnits()));
+      const val: *T = @ptrCast(static.ptr);
+      const active_tag = std.meta.activeTag(val.*);
+      // we dont need to align static again since if the tag is first,
+      // it had greater alignment and hence static data is aligned already
+
+      inline for (fields) |f| {
+        const field_as_tag = comptime std.meta.stringToEnum(ui.tag_type.?, f.original.name);
+        if (field_as_tag == active_tag) {
+          const child_static = if (tag_first) static.from(max_child_static_size).assertAligned(f.merged.Signature.alignment)
+            else static.till(f.merged.Signature.static_size).assertAligned(f.merged.Signature.alignment);
+
+          if (std.meta.hasFn(f.merged, "getDynamicSize")) {
+            const aligned_dynamic = dynamic.alignForward(.fromByteUnits(f.merged.Signature.D.alignment));
+            const written = f.merged.repointer(child_static, aligned_dynamic);
+
+            if (builtin.mode == .Debug) {
+              std.debug.assert(written == f.merged.getDynamicSize(&@field(val.*, f.original.name), @intFromPtr(aligned_dynamic.ptr)) - @intFromPtr(aligned_dynamic.ptr));
+            }
+
+            return written + @intFromPtr(aligned_dynamic.ptr) - @intFromPtr(dynamic.ptr);
+          } else {
+            return 0;
+          }
+        }
+      }
+      unreachable; // Should never heppen
     }
   };
 
