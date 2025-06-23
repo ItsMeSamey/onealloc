@@ -781,7 +781,7 @@ pub fn GetUnionMergedT(context: Context) type {
     pub const Signature = MergedSignature{
       .T = T,
       .D = Bytes(.@"1"),
-      .static_size = std.mem.alignForward(usize, max_child_static_size + Tag.Signature.static_size, alignment.toByteUnits()),
+      .static_size = @sizeOf(T),
       .alignment = alignment,
     };
 
@@ -789,7 +789,7 @@ pub fn GetUnionMergedT(context: Context) type {
       std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Signature.alignment.toByteUnits()));
       const active_tag = std.meta.activeTag(val.*);
       if (tag_first) {
-        std.debug.assert(0 == Tag.write(&active_tag, static.till(max_child_static_size), undefined));
+        std.debug.assert(0 == Tag.write(&active_tag, static.till(Tag.Signature.static_size), undefined));
       } else {
         std.debug.assert(0 == Tag.write(&active_tag, static.from(max_child_static_size), undefined));
       }
