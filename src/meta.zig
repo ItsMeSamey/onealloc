@@ -149,20 +149,30 @@ pub fn Bytes(comptime _alignment: std.mem.Alignment) type {
 
 pub fn GetContext(Options: type) type {
   return struct {
+    /// What should be the alignment of the type being merged
     align_hint: ?std.mem.Alignment,
+    /// The types that have been seen so far
     seen_types: []const type,
+    /// The types that have been merged so far (each corresponding to a seen type)
     result_types: []const type,
-    options: Options,
+    /// If we have seen a type passed to .see before, this will give it's index
     seen_recursive: comptime_int,
+    /// The options used by the merging function
+    options: Options,
+    /// The function that will be used to merge a type
+    merge: fn (context: @This()) type,
 
-    pub fn init(options: Options) @This() {
-      return .{
+    pub fn init(options: Options, merge_fn: fn (context: @This()) type) type {
+      const self = @This(){
         .align_hint = null,
         .seen_types = &.{},
         .result_types = &.{},
         .options = options,
         .seen_recursive = -1,
+        .merge = merge_fn,
       };
+
+      return self.merge(self);
     }
 
     pub fn realign(self: @This(), align_hint: ?std.mem.Alignment) @This() {

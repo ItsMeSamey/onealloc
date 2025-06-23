@@ -74,7 +74,7 @@ pub fn GetOnePointerMergedT(context: Context) type {
 
   const Retval = opaque {
     const next_context = context.realign(.fromByteUnits(pi.alignment)).see(T, @This());
-    const Child = ToMergedT(next_context.T(pi.child));
+    const Child = context.merge(next_context.T(pi.child));
 
     const S = Bytes(Signature.alignment);
     pub const Signature = MergedSignature{
@@ -175,7 +175,7 @@ pub fn GetSliceMergedT(context: Context) type {
       if (next_context.seen_recursive == -1) retval.deslice -= 1;
       break :blk retval;
     };
-    const Child = ToMergedT(next_context.reop(next_options).T(pi.child));
+    const Child = context.merge(next_context.reop(next_options).T(pi.child));
     const SubStatic = !std.meta.hasFn(Child, "getDynamicSize");
     const S = Bytes(Signature.alignment);
     pub const Signature = MergedSignature{
@@ -275,7 +275,7 @@ pub fn GetArrayMergedT(context: Context) type {
   @setEvalBranchQuota(1000_000);
   const ai = @typeInfo(T).array;
   // No need to .see(T) here as the child will handle this anyway and if the array type is repeated, the child will be too.
-  const Child = ToMergedT(context.realign(null).T(ai.child));
+  const Child = context.merge(context.realign(null).T(ai.child));
 
   // If the child has no dynamic data, the entire array is static.
   // We can treat it as a direct memory copy.
@@ -370,7 +370,7 @@ pub fn GetStructMergedT(context: Context) type {
       for (si.fields, 0..) |f, i| {
         pfields[i] = .{
           .original = f,
-          .merged = ToMergedT(next_context.realign(if (si.layout == .@"packed") .@"1" else .fromByteUnits(f.alignment)).T(f.type)),
+          .merged = context.merge(next_context.realign(if (si.layout == .@"packed") .@"1" else .fromByteUnits(f.alignment)).T(f.type)),
           .static_offset = @offsetOf(T, f.name),
         };
       }
@@ -466,14 +466,14 @@ pub fn GetStructMergedT(context: Context) type {
 pub fn GetOptionalMergedT(context: Context) type {
   const T = context.options.T;
   const oi = @typeInfo(T).optional;
-  const Child = ToMergedT(context.T(oi.child));
+  const Child = context.merge(context.T(oi.child));
   if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(context);
 
   if (context.options.error_on_unsafe_conversion) {
     @compileError("Cannot merge unsafe optional type " ++ @typeName(T));
   }
 
-  const Tag = ToMergedT(context.T(bool));
+  const Tag = context.merge(context.T(bool));
 
   const alignment = context.align_hint orelse .fromByteUnits(@alignOf(T));
   return opaque {
@@ -542,14 +542,14 @@ pub fn GetErrorUnionMergedT(context: Context) type {
   const ErrorSet = ei.error_set;
   const ErrorInt = std.meta.Int(.unsigned, @bitSizeOf(ErrorSet));
 
-  const Child = ToMergedT(context.T(Payload));
+  const Child = context.merge(context.T(Payload));
   if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(context);
 
   if (context.options.error_on_unsafe_conversion) {
     @compileError("Cannot merge unsafe error union type " ++ @typeName(T));
   }
 
-  const Err = ToMergedT(context.T(ErrorInt));
+  const Err = context.merge(context.T(ErrorInt));
 
   const ErrSize = Err.Signature.static_size;
   const PayloadSize = Child.Signature.static_size;
@@ -641,13 +641,13 @@ pub fn GetUnionMergedT(context: Context) type {
         }
         pfields[i] = .{
           .original = f,
-          .merged = ToMergedT(next_context.realign(.fromByteUnits(f.alignment)).T(f.type)),
+          .merged = context.merge(next_context.realign(.fromByteUnits(f.alignment)).T(f.type)),
         };
       }
       break :blk pfields;
     };
 
-    const Tag = ToMergedT(context.realign(null).T(TagType));
+    const Tag = context.merge(context.realign(null).T(TagType));
     const max_child_static_size = blk: {
       var max_size: usize = 0;
       for (fields) |f| max_size = @max(max_size, f.merged.Signature.static_size);
@@ -819,7 +819,7 @@ const testing = std.testing;
 const expectEqual = @import("testing.zig").expectEqual;
 
 fn _testMergingDemerging(value: anytype, comptime options: ToMergedOptions) !void {
-  const MergedT = ToMergedT(.init(options));
+  const MergedT = Context.init(options, ToMergedT);
   const static_size = MergedT.Signature.static_size;
   var buffer: [static_size + 4096]u8 = undefined;
 
@@ -1481,7 +1481,7 @@ pub fn WrapConverted(MergedT: type) type {
 }
 
 pub fn Wrapper(options: ToMergedOptions) type {
-  return WrapConverted(ToMergedT(.init(options)));
+  return WrapConverted(Context.init(options, ToMergedT));
 }
 
 // ========================================
