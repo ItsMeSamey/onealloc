@@ -1532,11 +1532,9 @@ pub fn WrapConverted(MergedT: type) type {
     /// Expects there to be no data cycles
     pub fn init(allocator: std.mem.Allocator, value: *const T) !@This() {
       const memory = try allocator.alignedAlloc(u8, MergedT.Signature.alignment.toByteUnits(), getSize(value));
-
-      const dynamic_buffer = MergedT.Signature.D.init(memory[MergedT.Signature.static_size..]).alignForward(.fromByteUnits(MergedT.Signature.D.alignment));
-      _ = MergedT.write(value, .initAssert(memory[0..MergedT.Signature.static_size]), dynamic_buffer);
-
-      return .{ .memory = memory };
+      var retval: @This() = .{ .memory = memory };
+      retval.setAssert(value);
+      return retval;
     }
 
     /// Frees the memory owned by the Wrapper.
@@ -1560,18 +1558,12 @@ pub fn WrapConverted(MergedT: type) type {
     pub fn set(self: *@This(), allocator: std.mem.Allocator, value: *const T) !void {
       const memory = try allocator.realloc(self.memory, getSize(value));
       self.memory = memory;
-
-      const dynamic_buffer = MergedT.Signature.D.init(memory[MergedT.Signature.static_size..]).alignForward(.fromByteUnits(MergedT.Signature.D.alignment));
-      const written = MergedT.write(value, .initAssert(memory[0..MergedT.Signature.static_size]), dynamic_buffer);
-
-      if (builtin.mode == .Debug) {
-        std.debug.assert(written + @intFromPtr(dynamic_buffer.ptr) - @intFromPtr(memory.ptr) == getSize(value));
-      }
+      return self.setAssert(value);
     }
 
     /// Set a new value into the wrapper, asserting that underlying allocation can hold it. Invalidates any references to the old value
     /// Expects there to be no data cycles
-    pub fn setAssert(self: *@This(), value: *const T) !void {
+    pub fn setAssert(self: *@This(), value: *const T) void {
       if (builtin.mode == .Debug) { // debug.assert alone may does not be optimized out
         std.debug.assert(getSize(value) <= self.memory.len);
       }
