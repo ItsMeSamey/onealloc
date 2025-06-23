@@ -199,8 +199,10 @@ pub fn GetOnePointerMergedT(context: Context) type {
       std.debug.assert(std.mem.isAligned(@intFromPtr(static.ptr), Pointer.Signature.alignment.toByteUnits()));
       std.debug.assert(std.mem.isAligned(@intFromPtr(_dynamic.ptr), Signature.D.alignment));
 
-      if (is_optional and val.* == null) return Pointer.write(&@as(T, null), static, undefined);
-
+      if (is_optional and val.* == null) {
+        std.debug.assert(0 == Pointer.write(&@as(T, null), static, undefined));
+        return 0;
+      }
       const dynamic = if (is_optional) _dynamic.alignForward(Child.Signature.alignment) else _dynamic;
       const dptr: T = @ptrCast(@alignCast(dynamic.ptr));
       std.debug.assert(0 == Pointer.write(&dptr, static, undefined));
@@ -241,7 +243,9 @@ pub fn GetOnePointerMergedT(context: Context) type {
       const dynamic = if (is_optional) _dynamic.alignForward(Child.Signature.alignment) else _dynamic;
       const dptr: T = @ptrCast(@alignCast(dynamic.ptr));
       std.debug.assert(0 == Pointer.write(&dptr, static, undefined));
-      if (!std.meta.hasFn(Child, "repointer")) return 0;
+      if (!std.meta.hasFn(Child, "repointer")) {
+        return Child.Signature.static_size + @intFromPtr(dynamic.ptr) - @intFromPtr(_dynamic.ptr);
+      }
 
       const child_static = dynamic.till(Child.Signature.static_size);
       // Align 1 if child is static, so no issue here, static and dynamic children an be written by same logic
@@ -249,7 +253,8 @@ pub fn GetOnePointerMergedT(context: Context) type {
       const written = Child.repointer(child_static, child_dynamic);
 
       if (std.meta.hasFn(Child, "getDynamicSize") and builtin.mode == .Debug) {
-        std.debug.assert(written == Child.getDynamicSize(@as(*T, @ptrCast(static.ptr)), @intFromPtr(child_dynamic.ptr)) - @intFromPtr(child_dynamic.ptr));
+        const val = @as(*T, @ptrCast(static.ptr)).*;
+        std.debug.assert(written == Child.getDynamicSize(if (is_optional) val.? else val, @intFromPtr(child_dynamic.ptr)) - @intFromPtr(child_dynamic.ptr));
       }
 
       return written + @intFromPtr(child_dynamic.ptr) - @intFromPtr(_dynamic.ptr);
@@ -636,6 +641,7 @@ pub fn GetOptionalMergedT(context: Context) type {
 
         return written + @intFromPtr(aligned_dynamic.ptr) - @intFromPtr(dynamic.ptr);
       }
+      return 0;
     }
   };
 }
@@ -936,7 +942,21 @@ fn _testMergingDemerging(value: anytype, comptime options: ToMergedOptions) !voi
   const written_dynamic_size = MergedT.write(&value, .initAssert(buffer[0..static_size]), .initAssert(buffer[dynamic_from..]));
   try std.testing.expectEqual(total_size - dynamic_from, written_dynamic_size);
 
-  try expectEqual(&value, @as(*@TypeOf(value), @ptrFromInt(@intFromPtr(&buffer))));
+  try expectEqual(&value, @as(*@TypeOf(value), @ptrCast(@alignCast(&buffer))));
+
+  const copy = try testing.allocator.alignedAlloc(u8, MergedT.Signature.alignment.toByteUnits(), total_size);
+  defer testing.allocator.free(copy);
+  @memcpy(copy, buffer[0..total_size]);
+  @memset(buffer[0..total_size], 0);
+
+  // repointer only is non static
+  if (std.meta.hasFn(MergedT, "getDynamicSize")) {
+    const repointered_size = MergedT.repointer(.initAssert(copy[0..static_size]), .initAssert(copy[dynamic_from..]));
+    try std.testing.expectEqual(written_dynamic_size, repointered_size);
+  }
+
+  // verify
+  try expectEqual(&value, @as(*@TypeOf(value), @ptrCast(copy)));
 }
 
 fn testMerging(value: anytype) !void {
