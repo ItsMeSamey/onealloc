@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const meta = @import("meta.zig");
 const Bytes = meta.Bytes;
+pub const Context = meta.GetContext(ToMergedOptions);
 
 /// Options to control how merging of a type is performed
 pub const ToMergedOptions = struct {
@@ -38,59 +39,6 @@ pub const MergedSignature = struct {
   static_size: comptime_int,
   /// Always .@"1" unless .default is used
   alignment: std.mem.Alignment,
-};
-
-const Context = struct {
-  align_hint: ?std.mem.Alignment,
-  seen_types: []const type,
-  result_types: []const type,
-  options: ToMergedOptions,
-  seen_recursive: comptime_int,
-
-  pub fn init(options: ToMergedOptions) @This() {
-    return .{
-      .align_hint = null,
-      .seen_types = &.{},
-      .result_types = &.{},
-      .options = options,
-      .seen_recursive = -1,
-    };
-  }
-
-  pub fn realign(self: @This(), align_hint: ?std.mem.Alignment) @This() {
-    var retval = self;
-    retval.align_hint = align_hint;
-    return retval;
-  }
-
-  pub fn see(self: @This(), new_T: type, Result: type) @This() { // Yes we can do this, Zig is f****ing awesome
-    const have_seen = comptime blk: {
-      for (self.seen_types, 0..) |t, i| if (new_T == t) break :blk i;
-      break :blk -1;
-    };
-
-    if (have_seen != -1 and !self.options.allow_recursive_rereferencing) {
-      @compileError("Recursive type " ++ @typeName(new_T) ++ " is not allowed to be referenced by another type");
-    }
-
-    var retval = self;
-    retval.seen_types = self.seen_types ++ [1]type{new_T};
-    retval.result_types = self.result_types ++ [1]type{Result};
-    retval.seen_recursive = have_seen;
-    return retval;
-  }
-
-  pub fn reop(self: @This(), options: ToMergedOptions) @This() {
-    var retval = self;
-    retval.options = options;
-    return retval;
-  }
-
-  pub fn T(self: @This(), comptime new_T: type) @This() {
-    var retval = self;
-    retval.options.T = new_T;
-    return retval;
-  }
 };
 
 /// We take in a type and just use its byte representation to store into bits.

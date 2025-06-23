@@ -147,6 +147,62 @@ pub fn Bytes(comptime _alignment: std.mem.Alignment) type {
   };
 }
 
+pub fn GetContext(Options: type) type {
+  return struct {
+    align_hint: ?std.mem.Alignment,
+    seen_types: []const type,
+    result_types: []const type,
+    options: Options,
+    seen_recursive: comptime_int,
+
+    pub fn init(options: Options) @This() {
+      return .{
+        .align_hint = null,
+        .seen_types = &.{},
+        .result_types = &.{},
+        .options = options,
+        .seen_recursive = -1,
+      };
+    }
+
+    pub fn realign(self: @This(), align_hint: ?std.mem.Alignment) @This() {
+      var retval = self;
+      retval.align_hint = align_hint;
+      return retval;
+    }
+
+    pub fn see(self: @This(), new_T: type, Result: type) @This() { // Yes we can do this, Zig is f****ing awesome
+      const have_seen = comptime blk: {
+        for (self.seen_types, 0..) |t, i| if (new_T == t) break :blk i;
+        break :blk -1;
+      };
+
+      if (have_seen != -1 and !self.options.allow_recursive_rereferencing) {
+        @compileError("Recursive type " ++ @typeName(new_T) ++ " is not allowed to be referenced by another type");
+      }
+
+      var retval = self;
+      retval.seen_types = self.seen_types ++ [1]type{new_T};
+      retval.result_types = self.result_types ++ [1]type{Result};
+      retval.seen_recursive = have_seen;
+      return retval;
+    }
+
+    pub fn reop(self: @This(), options: Options) @This() {
+      var retval = self;
+      retval.options = options;
+      return retval;
+    }
+
+    pub fn T(self: @This(), comptime new_T: type) @This() {
+      var retval = self;
+      retval.options.T = new_T;
+      return retval;
+    }
+  };
+}
+
+
 // ========================================
 //                 Testing                 
 // ========================================
