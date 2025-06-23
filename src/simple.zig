@@ -1547,7 +1547,7 @@ pub fn WrapConverted(MergedT: type) type {
     /// Returns a mutable pointer to the merged data, allowing modification.
     /// The pointer is valid as long as the Wrapper is not de-initialized.
     pub fn get(self: *const @This()) *T {
-      return @as(*T, @alignCast(@ptrCast(self.memory.ptr)));
+      return @as(*T, @ptrCast(self.memory.ptr));
     }
 
     /// Creates a new, independent Wrapper containing a deep copy of the data.
@@ -1562,7 +1562,11 @@ pub fn WrapConverted(MergedT: type) type {
       self.memory = memory;
 
       const dynamic_buffer = MergedT.Signature.D.init(memory[MergedT.Signature.static_size..]).alignForward(.fromByteUnits(MergedT.Signature.D.alignment));
-      _ = MergedT.write(value, .initAssert(memory[0..MergedT.Signature.static_size]), dynamic_buffer);
+      const written = MergedT.write(value, .initAssert(memory[0..MergedT.Signature.static_size]), dynamic_buffer);
+
+      if (builtin.mode == .Debug) {
+        std.debug.assert(written + @intFromPtr(dynamic_buffer.ptr) - @intFromPtr(memory.ptr) == getSize(value));
+      }
     }
 
     /// Set a new value into the wrapper, asserting that underlying allocation can hold it. Invalidates any references to the old value
@@ -1572,7 +1576,11 @@ pub fn WrapConverted(MergedT: type) type {
         std.debug.assert(getSize(value) <= self.memory.len);
       }
       const dynamic_buffer = MergedT.Signature.D.init(self.memory[MergedT.Signature.static_size..]).alignForward(.fromByteUnits(MergedT.Signature.D.alignment));
-      _ = MergedT.write(value, .initAssert(self.memory[0..MergedT.Signature.static_size]), dynamic_buffer);
+      const written = MergedT.write(value, .initAssert(self.memory[0..MergedT.Signature.static_size]), dynamic_buffer);
+
+      if (builtin.mode == .Debug) {
+        std.debug.assert(written + @intFromPtr(dynamic_buffer.ptr) - @intFromPtr(self.memory.ptr) == getSize(value));
+      }
     }
 
 
@@ -1585,10 +1593,11 @@ pub fn WrapConverted(MergedT: type) type {
       if (static_size == 0) return;
 
       const dynamic_from = std.mem.alignForward(usize, static_size, MergedT.Signature.D.alignment);
-      _ = MergedT.repointer(
-        .initAssert(self.memory[0..static_size]), 
-        .initAssert(self.memory[dynamic_from..])
-      );
+      const written = MergedT.repointer(.initAssert(self.memory[0..static_size]), .initAssert(self.memory[dynamic_from..]));
+
+      if (builtin.mode == .Debug) {
+        std.debug.assert(written + dynamic_from == getSize(self.get()));
+      }
     }
   };
 }
