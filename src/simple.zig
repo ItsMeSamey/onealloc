@@ -25,6 +25,8 @@ pub const ToMergedOptions = struct {
   /// Allow for recursive re-referencing, eg. (A has ?*A), (A has ?*B, B has ?*A), etc.
   /// When this is false and the type is recursive, compilation will error
   allow_recursive_rereferencing: bool = false,
+  /// Only allow for safe conversions (eg: compileError on trying to merge dynamic union, dynamic error union and dynamic optional)
+  error_on_unsafe_conversion: bool = false,
 };
 
 /// This is used to recognize if types were returned by ToMerged.
@@ -468,6 +470,11 @@ pub fn GetOptionalMergedT(context: Context) type {
 
   const Child = ToMergedT(context.T(oi.child));
   if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(context);
+
+  if (context.options.error_on_unsafe_conversion) {
+    @compileError("Cannot merge unsafe union type " ++ @typeName(T));
+  }
+
   const Tag = ToMergedT(context.T(bool));
 
   const alignment = context.align_hint orelse .fromByteUnits(@alignOf(T));
@@ -521,6 +528,11 @@ pub fn GetErrorUnionMergedT(context: Context) type {
 
   const Child = ToMergedT(context.T(Payload));
   if (!std.meta.hasFn(Child, "getDynamicSize")) return GetDirectMergedT(context);
+
+  if (context.options.error_on_unsafe_conversion) {
+    @compileError("Cannot merge unsafe union type " ++ @typeName(T));
+  }
+
   const Err = ToMergedT(context.T(ErrorInt));
 
   const ErrSize = Err.Signature.static_size;
@@ -687,6 +699,10 @@ pub fn GetUnionMergedT(context: Context) type {
     }
     break :blk true;
   }) return GetDirectMergedT(context);
+
+  if (context.options.error_on_unsafe_conversion) {
+    @compileError("Cannot merge unsafe union type " ++ @typeName(T));
+  }
 
   return Retval;
 }
@@ -1296,15 +1312,17 @@ test "deeply nested, mutually recursive structures with no data cycles" {
 //                 Wrapper                 
 // ========================================
 
+
 /// A generic wrapper that manages the memory for a merged object.
-pub fn Wrapper(options: ToMergedOptions) type {
+pub fn WrapConverted(MergedT: type) type {
+  const T = MergedT.Signature.T;
   return struct {
-    pub const MergedT = ToMergedT(.init(options));
+    pub const Underlying = MergedT;
     memory: []align(MergedT.Signature.alignment.toByteUnits()) u8,
 
     /// Returns the total size that would be required to store this value
     /// Expects there to be no data cycles
-    pub fn getSize(value: *const options.T) usize {
+    pub fn getSize(value: *const T) usize {
       const static_size = MergedT.Signature.static_size;
       return if (@hasDecl(MergedT, "getDynamicSize")) MergedT.getDynamicSize(value, static_size) else static_size;
     }
@@ -1312,7 +1330,7 @@ pub fn Wrapper(options: ToMergedOptions) type {
     /// Allocates memory and merges the initial value into a self-managed buffer.
     /// The Wrapper instance owns the memory and must be de-initialized with `deinit`.
     /// Expects there to be no data cycles
-    pub fn init(allocator: std.mem.Allocator, value: *const options.T) !@This() {
+    pub fn init(allocator: std.mem.Allocator, value: *const T) !@This() {
       const memory = try allocator.alignedAlloc(u8, MergedT.Signature.alignment.toByteUnits(), getSize(value));
 
       const dynamic_buffer = MergedT.Signature.D.init(memory[MergedT.Signature.static_size..]).alignForward(.fromByteUnits(MergedT.Signature.D.alignment));
@@ -1328,8 +1346,8 @@ pub fn Wrapper(options: ToMergedOptions) type {
 
     /// Returns a mutable pointer to the merged data, allowing modification.
     /// The pointer is valid as long as the Wrapper is not de-initialized.
-    pub fn get(self: *const @This()) *options.T {
-      return @as(*options.T, @alignCast(@ptrCast(self.memory.ptr)));
+    pub fn get(self: *const @This()) *T {
+      return @as(*T, @alignCast(@ptrCast(self.memory.ptr)));
     }
 
     /// Creates a new, independent Wrapper containing a deep copy of the data.
@@ -1339,7 +1357,7 @@ pub fn Wrapper(options: ToMergedOptions) type {
 
     /// Set a new value into the wrapper. Invalidates any references to the old value
     /// Expects there to be no data cycles
-    pub fn set(self: *@This(), allocator: std.mem.Allocator, value: *const options.T) !void {
+    pub fn set(self: *@This(), allocator: std.mem.Allocator, value: *const T) !void {
       const memory = try allocator.realloc(self.memory, getSize(value));
       self.memory = memory;
 
@@ -1349,7 +1367,7 @@ pub fn Wrapper(options: ToMergedOptions) type {
 
     /// Set a new value into the wrapper, asserting that underlying allocation can hold it. Invalidates any references to the old value
     /// Expects there to be no data cycles
-    pub fn setAssert(self: *@This(), value: *const options.T) !void {
+    pub fn setAssert(self: *@This(), value: *const T) !void {
       if (builtin.mode == .Debug) { // debug.assert alone may does not be optimized out
         std.debug.assert(getSize(value) < self.memory.len);
       }
@@ -1357,6 +1375,10 @@ pub fn Wrapper(options: ToMergedOptions) type {
       _ = MergedT.write(value, .initAssert(self.memory[0..MergedT.Signature.static_size]), dynamic_buffer);
     }
   };
+}
+
+pub fn Wrapper(options: ToMergedOptions) type {
+  return WrapConverted(ToMergedT(.init(options)));
 }
 
 

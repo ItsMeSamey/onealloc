@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const testing = std.testing;
 
@@ -87,6 +88,63 @@ pub fn ContainsT(parent: type, child: type) bool {
     .vector => |vi| return ContainsT(vi.child, child),
   }
   return false;
+}
+
+/// We dont need the length of the allocations but they are useful for debugging
+/// This is a helper type designed to help with catching errors
+pub fn Bytes(comptime _alignment: std.mem.Alignment) type {
+  return struct {
+    ptr: [*]align(alignment) u8,
+    /// We only use this in debug mode
+    _len: if (builtin.mode == .Debug) usize else void,
+
+    pub const alignment = _alignment.toByteUnits();
+
+    pub fn init(v: []align(alignment) u8) @This() {
+      return .{ .ptr = v.ptr, ._len = if (builtin.mode == .Debug) v.len else {} };
+    }
+
+    pub fn initAssert(v: []u8) @This() {
+      std.debug.assert(std.mem.isAligned(@intFromPtr(v.ptr), _alignment.toByteUnits()));
+      return .{ .ptr = @alignCast(v.ptr), ._len = if (builtin.mode == .Debug) v.len else {} };
+    }
+
+    pub fn from(self: @This(), index: usize) Bytes(.@"1") {
+      if (builtin.mode == .Debug and index > self._len) {
+        std.debug.panic("Index {d} is out of bounds for slice of length {d}\n", .{ index, self._len });
+      }
+      return .{ .ptr = self.ptr + index, ._len = if (builtin.mode == .Debug) self._len - index else {} };
+    }
+
+    pub fn till(self: @This(), index: usize) @This() {
+      if (builtin.mode == .Debug and index > self._len) {
+        std.debug.panic("Index {d} is out of bounds for slice of length {d}\n", .{ index, self._len });
+      }
+      return .{ .ptr = self.ptr, ._len = if (builtin.mode == .Debug) index else {} };
+    }
+
+    pub fn range(self: @This(), start_index: usize, end_index: usize) @This() {
+      return self.from(start_index).till(end_index);
+    }
+
+    pub fn slice(self: @This(), end_index: usize) []align(alignment) u8 {
+      // .till is used for bounds checking in debug mode, otherwise its just a no-op
+      return self.till(end_index).ptr[0..end_index];
+    }
+
+    pub fn assertAligned(self: @This(), comptime new_alignment: std.mem.Alignment) if (new_alignment == _alignment) @This() else Bytes(new_alignment) {
+      std.debug.assert(std.mem.isAligned(@intFromPtr(self.ptr), new_alignment.toByteUnits()));
+      return .{ .ptr = @alignCast(self.ptr), ._len = self._len };
+    }
+
+    pub fn alignForward(self: @This(), comptime new_alignment: std.mem.Alignment) if (new_alignment == _alignment) @This() else Bytes(new_alignment) {
+      const aligned_ptr = std.mem.alignForward(usize, @intFromPtr(self.ptr), new_alignment.toByteUnits());
+      return .{
+        .ptr = @ptrFromInt(aligned_ptr),
+        ._len = self._len - (aligned_ptr - @intFromPtr(self.ptr)) // Underflow => user error
+      };
+    }
+  };
 }
 
 // ========================================
