@@ -1,15 +1,14 @@
 # OneAlloc: Allocate Everything All At Once
 
-A simple library to convert complex data structures with pointers and slices into a single, contiguous memory allocation.
-
-It is ideal for scenarios where data locality is critical, such as preparing data for IPC, caching, etc. It also provides helpers to make data.
+A simple library to convert complex data structures with pointers and slices into a **portable**, **contiguous** and **single** memory allocation.
 
 Merged memory is **portable** and self-contained. It may be used for:
 *   On-disk serialization.
 *   Inter-process communication (IPC).
 *   Network transport.
 
-Do note that there are many options that make memory NOT self-contained, but this is not the case by default.
+> [!WARNING]
+> There are some options that may make memory NOT self-contained, but they are not the defaults.
 
 ```zig
 const std = @import("std");
@@ -63,6 +62,7 @@ Feel free to play around with it, but do NOT use it in any serious projects and 
   - [Updating Data](#updating-data)
 * [Configuration (`SimpleOptions`)](#configuration-simpleoptions)
 * [How It Works: Memory Layout](#how-it-works-memory-layout)
+* [Portability & The `repointer` Method](#portability--the-repointer-method)
 * [Handling Recursion](#handling-recursion)
 * [Limitations & Caveats](#limitations--caveats)
 
@@ -191,6 +191,51 @@ OneAlloc divides the single memory block into two sections:
 *   **Dynamic Buffer:** This immediately follows the static buffer. It holds all the variable-sized data that the static part's pointers and slices now point to. For example, the characters of a `[]const u8` are stored here.
 
 The pointers within the static buffer are updated to point to their corresponding data within the dynamic buffer, making the entire block self-contained.
+
+# Portability & The `repointer` Method
+The primary goal of OneAlloc is to create portable, self-contained memory blocks.
+However, when a block is moved—for example, written to a file and read back, or sent over a network—the absolute memory addresses of the internal pointers become invalid.
+
+To solve this, you can use the repointer method:
+
+#### repointer()
+This method walks the entire merged data structure and updates all internal pointers to be correct relative to the new base address of the .memory block.
+You must call this method after you move the memory block to a new location.
+
+You MUST call `repointer()` after:
+* memcpy-ing the .memory slice to a new location.
+* receiving the memory block over a network.
+* loading the memory block from a file or database.
+
+Example:
+```zig
+const LogEntry = struct {
+    timestamp: u64,
+    message: []const u8
+};
+const LogWrapper = onealloc.Wrapper(.{ .T = LogEntry });
+
+var wrapped = try LogWrapper.init(allocator, &.{ .timestamp = 12345, .message = "initial message" });
+
+// Simulate moving memory. (no, .dupe does not work as it wont preserve the alignment)
+const new_buffer = try allocator.alignedAlloc(u8, LogWrapper.Underlying.Signature.alignment.toByteUnits(), wrapped.memory.len);
+@memcpy(new_buffer, wrapped.memory);
+wrapped.deinit(allocator);
+
+// Free original memory
+var new_wrapped = LogWrapper{ .memory = new_buffer };
+
+// Internal pointers are now invalidated
+// Call `repointer` to fix them.
+new_wrapped.repointer();
+
+// Now the data is safe to access again
+const entry = new_wrapped.get();
+try testing.expectEqualSlices(u8, "initial message", entry.message);
+```
+
+> [!NOTE]
+> If a type contains no dynamic data (pointers, slices), repointer() is a no-op and has no overhead, as there are no internal pointers to update.
 
 # Handling Recursion
 By default, the library will throw a compile error if it detects a recursive type definition.
