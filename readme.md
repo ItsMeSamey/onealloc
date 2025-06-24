@@ -1,6 +1,6 @@
 # OneAlloc: Allocate Everything All At Once
 
-A simple library to convert complex data structures with pointers and slices into a **portable**, **contiguous** and **single** memory allocation.
+Convert complex data structures with pointers and slices into a **portable**, **contiguous** and **single** memory allocations.
 
 Merged memory is **portable** and self-contained. It may be used for:
 *   On-disk serialization.
@@ -307,4 +307,4 @@ As mentioned above, attempting to merge a data structure with a cycle will cause
 The following types cannot be merged or have limited support:
 *   **Dynamic Packed Structs (with Pointers):** These are not supported and will cause a compile error.
 *   **Dynamic Untagged Unions (with Pointers/Slices):** These lack a tag and cannot be safely merged. They will cause a compile error.
-
+*   **C and Many pointers:** You can choose to serialize them as raw values but it is **NOT** possible make these **portable**.
