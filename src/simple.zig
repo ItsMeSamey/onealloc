@@ -1,7 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const meta = @import("meta.zig");
+
 const Bytes = meta.Bytes;
+const MergedSignature = meta.MergedSignature;
 pub const Context = meta.GetContext(ToMergedOptions);
 
 /// Options to control how merging of a type is performed
@@ -24,21 +26,10 @@ pub const ToMergedOptions = struct {
   /// Allow for recursive re-referencing, eg. (A has ?*A), (A has ?*B, B has ?*A), etc.
   /// When this is false and the type is recursive, compilation will error
   allow_recursive_rereferencing: bool = false,
+  /// Serialize unknown pointers (C / Many / opaque pointers) as usize
+  serialize_unknown_pointer_as_usize: bool = false,
   /// Only allow for safe conversions (eg: compileError on trying to merge dynamic union, dynamic error union and dynamic optional)
   error_on_unsafe_conversion: bool = false,
-};
-
-/// This is used to recognize if types were returned by ToMerged.
-/// This is done by assigning `pub const Signature = MergedSignature;` inside an opaque
-pub const MergedSignature = struct {
-  /// The underlying type that was transformed
-  T: type,
-  /// The type of dynamic data that will be written to by the child
-  D: type,
-  /// Static size (in bits if pack, in bytes if default/noalign)
-  static_size: comptime_int,
-  /// Always .@"1" unless .default is used
-  alignment: std.mem.Alignment,
 };
 
 /// We take in a type and just use its byte representation to store into bits.
@@ -777,7 +768,7 @@ pub fn ToMergedT(context: Context) type {
   const T = context.options.T;
   @setEvalBranchQuota(1000_000);
   return switch (@typeInfo(T)) {
-    .type, .noreturn, .comptime_int, .comptime_float, .undefined, .@"fn", .frame, .@"anyframe", .enum_literal, .@"opaque" => {
+    .type, .noreturn, .comptime_int, .comptime_float, .undefined, .@"fn", .frame, .@"anyframe", .enum_literal => {
       @compileError("Type '" ++ @tagName(std.meta.activeTag(@typeInfo(T))) ++ "' is not mergeable\n");
     },
     .void, .bool, .int, .float, .vector, .error_set, .null => GetDirectMergedT(context),
@@ -786,7 +777,8 @@ pub fn ToMergedT(context: Context) type {
         @compileError(@tagName(pi.size) ++ " pointer cannot be serialized for type " ++ @typeName(T) ++ ", consider setting serialize_many_pointer_as_usize to true\n");
       },
       .one => switch (@typeInfo(pi.child)) {
-        .@"opaque" => if (@hasDecl(pi.child, "Signature") and @hasField(pi.child.Signature, "T") and @FieldType(pi.child.Signature, "T") == type) T else {
+        .@"opaque" => if (@hasDecl(pi.child, "Signature") and @TypeOf(pi.child.Signature) == MergedSignature) pi.child
+          else if (context.options.error_on_unsafe_conversion) GetDirectMergedT(context) else {
           @compileError("A non-mergeable opaque " ++ @typeName(pi.child) ++ " was provided to `ToMergedT`\n");
         },
         else => GetOnePointerMergedT(context),
@@ -808,6 +800,9 @@ pub fn ToMergedT(context: Context) type {
     .error_union => GetErrorUnionMergedT(context),
     .@"enum" => GetDirectMergedT(context),
     .@"union" => GetUnionMergedT(context),
+    .@"opaque" => if (@hasDecl(T, "Signature") and @TypeOf(T.Signature) == MergedSignature) T else {
+      @compileError("A non-mergeable opaque " ++ @typeName(T) ++ " was provided to `ToMergedT`\n");
+    },
   };
 }
 

@@ -3,6 +3,19 @@ const builtin = @import("builtin");
 const root = @import("root.zig");
 const testing = std.testing;
 
+/// This is used to recognize if types were returned by ToMerged.
+/// This is done by assigning `pub const Signature = MergedSignature;` inside an opaque
+pub const MergedSignature = struct {
+  /// The underlying type that was transformed
+  T: type,
+  /// The type of dynamic data that will be written to by the child
+  D: type,
+  /// Static size (in bits if pack, in bytes if default/noalign)
+  static_size: comptime_int,
+  /// Always .@"1" unless .default is used
+  alignment: std.mem.Alignment,
+};
+
 /// Given a function type, get the return type
 pub fn FnReturnType(T: type) type {
   return switch (@typeInfo(T)) {
