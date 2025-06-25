@@ -1,13 +1,13 @@
 # OneAlloc: Allocate Everything All At Once
 
-Convert complex data structures with pointers and slices into a **portable**, **contiguous** and **single** memory allocations.
+Convert complex data structures with pointers and slices into a **Somewhat portable**, **contiguous** and **single** memory allocations.
 
-Merged memory is **portable** and self-contained. It may be used for:
+Merged memory is self-contained. It may be used for:
 *   On-disk serialization.
 *   Inter-process communication (IPC).
-*   Network transport.
 
 > [!WARNING]
+> Same pointer size and endianness is required for all platforms.
 > There are some options that may make memory NOT self-contained, but they are not the defaults.
 
 ```zig
