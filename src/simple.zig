@@ -53,7 +53,7 @@ pub fn GetDirectMergedT(context: Context) type {
 }
 
 /// Convert a supplid pointer type to writable opaque
-pub fn GetOnePointerMergedT(context: Context) type {
+pub fn GetPointerMergedT(context: Context) type {
   const T = context.options.T;
   if (!context.options.dereference) return GetDirectMergedT(context);
 
@@ -781,7 +781,7 @@ pub fn ToMergedT(context: Context) type {
           else if (context.options.error_on_unsafe_conversion) GetDirectMergedT(context) else {
           @compileError("A non-mergeable opaque " ++ @typeName(pi.child) ++ " was provided to `ToMergedT`\n");
         },
-        else => GetOnePointerMergedT(context),
+        else => GetPointerMergedT(context),
       },
       .slice => GetSliceMergedT(context),
     },
@@ -792,7 +792,7 @@ pub fn ToMergedT(context: Context) type {
         .many, .c => if (context.options.serialize_unknown_pointer_as_usize) GetDirectMergedT(context) else {
           @compileError(@tagName(pi.size) ++ " pointer cannot be serialized for type " ++ @typeName(T) ++ ", consider setting serialize_many_pointer_as_usize to true\n");
         },
-        .one => GetOnePointerMergedT(context),
+        .one => GetPointerMergedT(context),
         .slice => GetSliceMergedT(context),
       },
       else => GetOptionalMergedT(context),
