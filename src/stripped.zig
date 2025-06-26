@@ -5,6 +5,7 @@ const simple = @import("simple.zig");
 
 const Bytes = meta.Bytes;
 const BytesLen = meta.BytesLen;
+const FnReturnType = meta.FnReturnType;
 const MergedSignature = simple.MergedSignature;
 pub const Context = meta.GetContext(ToMergedOptions);
 
@@ -54,28 +55,142 @@ pub fn GetDirectMergedT(context: Context) type {
   };
 }
 
-pub fn GetNullPointerMergedT(context: Context) type {
-
-}
-
+/// Convert a supplid pointer type to writable opaque
 pub fn GetPointerMergedT(context: Context) type {
   const T = context.options.T;
-  return opaque {
+  if (!context.options.dereference) return GetDirectMergedT(context);
+
+  const is_optional = @typeInfo(T) == .optional;
+  const pi = @typeInfo(if (is_optional) @typeInfo(T).optional.child else T).pointer;
+  std.debug.assert(pi.size == .one);
+
+  if (@sizeOf(pi.child) == 0) return opaque {
+    // We need a tag for zero sized types
+    const Existence = GetDirectMergedT(context.T(if (is_optional) u1 else void));
+    const S = Bytes(Signature.alignment);
+    pub const Signature = MergedSignature{
+      .T = T,
+      .D = Bytes(.@"1"),
+      .static_size = if (is_optional) 1 else 0,
+      .alignment = .@"1",
+    };
+
+    pub fn write(val: *const T, static: S, _dynamic: Signature.D) usize {
+      if (is_optional) {
+        if (val.* == null) {
+          std.debug.assert(0 == Existence.write(&@as(u1, 0), static, undefined));
+        } else {
+          std.debug.assert(0 == Existence.write(&@as(u1, 1), static, undefined));
+        }
+      }
+      return 0;
+    }
+
+    const Self = @This();
+    pub const GS = struct {
+      exists: if (is_optional) *u1 else void,
+
+      pub const Parent = Self;
+      pub fn get(self: GS) if (is_optional) ?pi.child else pi.child {
+        if (is_optional and self.exists.* == 0) return null;
+        return undefined;
+      }
+
+      pub fn set(self: GS, val: if (is_optional) ?*pi.child else *pi.child) void {
+        if (!is_optional) return;
+        if (val == null) {
+          self.exists.* = 0;
+        } else {
+          self.exists.* = 1;
+        }
+      }
+    };
+
+    pub fn read(static: S, _dynamic: Signature.D) GS {
+      return .{ .exists = if (is_optional) @as(*u1, @ptrCast(static.ptr)) else undefined };
+    }
   };
-}
 
-pub fn GetSliceMergedT(context: Context) type {
-}
+  const Retval = opaque {
+    const next_context = context.realign(.fromByteUnits(pi.alignment)).see(T, @This());
+    const Child = context.merge(next_context.T(pi.child));
 
-pub fn GetArrayMergedT(context: Context) type {
-}
+    const S = Bytes(Signature.alignment);
+    pub const Signature = MergedSignature{
+      .T = T,
+      .D = (if (is_optional or Child.Signature.D.need_len) BytesLen else Bytes)(if (is_optional) .@"1" else .fromByteUnits(pi.alignment)),
+      .static_size = Existence.Signature.static_size,
+      .alignment = .@"1",
+    };
 
-pub fn GetStructMergedT(context: Context) type {
-}
+    pub fn write(val: *const T, static: S, _dynamic: Signature.D) usize {
+      if (is_optional and val.* == null) return 0;
 
-pub const GetErrorUnionMergedT = simple.GetErrorUnionMergedT;
-pub const GetOptionalMergedT = simple.GetOptionalMergedT;
-pub const GetUnionMergedT = simple.GetUnionMergedT;
+      const dynamic = if (is_optional) _dynamic.alignForward(Child.Signature.alignment) else _dynamic;
+      const child_static = dynamic.till(Child.Signature.static_size);
+      // Align 1 if child is static, so no issue here, static and dynamic children an be written by same logic
+      const child_dynamic = dynamic.from(Child.Signature.static_size).alignForward(.fromByteUnits(Child.Signature.D.alignment));
+      const written = Child.write(if (is_optional) val.*.? else val.*, child_static, child_dynamic);
+
+      if (std.meta.hasFn(Child, "getDynamicSize") and builtin.mode == .Debug) {
+        std.debug.assert(written == Child.getDynamicSize(if (is_optional) val.*.? else val.*, @intFromPtr(child_dynamic.ptr)) - @intFromPtr(child_dynamic.ptr));
+      } else {
+        std.debug.assert(0 == written);
+      }
+
+      return written + @intFromPtr(child_dynamic.ptr) - @intFromPtr(_dynamic.ptr);
+    }
+
+    pub fn getDynamicSize(val: *const T, size: usize) usize {
+      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment));
+      var new_size = size;
+
+      if (is_optional) {
+        if (val.* == null) return new_size;
+        new_size = std.mem.alignForward(usize, new_size, Child.Signature.alignment.toByteUnits());
+      }
+
+      new_size += Child.Signature.static_size;
+      if (std.meta.hasFn(Child, "getDynamicSize")) {
+        new_size = std.mem.alignForward(usize, new_size, Child.Signature.D.alignment);
+        new_size = Child.getDynamicSize(if (is_optional) val.*.? else val.*, new_size);
+      }
+
+      return new_size;
+    }
+
+    const Self = @This();
+    pub const GS = struct {
+      dynamic: Signature.D,
+
+      pub const Parent = Self;
+      const GetRT = FnReturnType(Child.read);
+      pub fn get(self: GS) if (is_optional) ?GetRT else GetRT {
+        if (is_optional and self.dynamic.len == 0) return null;
+
+        const dynamic = if (is_optional) self.dynamic.alignForward(Child.Signature.alignment) else self.dynamic;
+        const child_static = dynamic.till(Child.Signature.static_size);
+        const child_dynamic = dynamic.from(Child.Signature.static_size).alignForward(.fromByteUnits(Child.Signature.D.alignment));
+
+        return Child.read(child_static, child_dynamic);
+      }
+
+      pub fn set(self: GS, val: *const T) void {
+        const child = if (is_optional) self.get().? // You cant set a null value
+          else self.get();
+        child.set(if (is_optional) val.*.? // You cant make a non-null value null
+          else val.*);
+      }
+    };
+
+    pub fn read(_: S, dynamic: Signature.D) GS {
+      return .{ .dynamic = dynamic };
+    }
+  };
+
+  if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
+  return Retval;
+}
 
 pub fn ToMergedT(context: Context) type {
   const T = context.options.T;

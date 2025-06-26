@@ -113,6 +113,7 @@ fn BytesExtra(comptime _alignment: std.mem.Alignment, _keep_len: bool) type {
     len: if (keep_len) usize else void,
 
     pub const alignment = _alignment.toByteUnits();
+    pub const need_len = _keep_len;
 
     pub fn init(v: []align(alignment) u8) @This() {
       return .{ .ptr = v.ptr, .len = if (keep_len) v.len else {} };
@@ -124,17 +125,24 @@ fn BytesExtra(comptime _alignment: std.mem.Alignment, _keep_len: bool) type {
     }
 
     pub fn from(self: @This(), index: usize) BytesExtra(.@"1", _keep_len) {
-      if (keep_len and index > self.len) {
+      if (keep_len and builtin.mode == .Debug and index > self.len) {
         std.debug.panic("Index {d} is out of bounds for slice of length {d}\n", .{ index, self.len });
       }
       return .{ .ptr = self.ptr + index, .len = if (keep_len) self.len - index else {} };
     }
 
-    pub fn till(self: @This(), index: usize) @This() {
-      if (keep_len and index > self.len) {
+    pub fn till(self: @This(), index: usize) BytesExtra(_alignment, false) {
+      if (keep_len and builtin.mode == .Debug and index > self.len) {
         std.debug.panic("Index {d} is out of bounds for slice of length {d}\n", .{ index, self.len });
       }
       return .{ .ptr = self.ptr, .len = if (keep_len) index else {} };
+    }
+
+    pub fn upto(self: @This(), index: usize) BytesExtra(_alignment, true) {
+      if (keep_len and builtin.mode == .Debug and index > self.len) {
+        std.debug.panic("Index {d} is out of bounds for slice of length {d}\n", .{ index, self.len });
+      }
+      return .{ .ptr = self.ptr, .len = index };
     }
 
     pub fn range(self: @This(), start_index: usize, end_index: usize) @This() {
