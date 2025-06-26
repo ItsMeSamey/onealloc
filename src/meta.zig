@@ -149,11 +149,6 @@ fn BytesExtra(comptime _alignment: std.mem.Alignment, _keep_len: bool) type {
       return self.from(start_index).till(end_index);
     }
 
-    pub fn slice(self: @This(), end_index: usize) []align(alignment) u8 {
-      // .till is used for bounds checking in debug mode, otherwise its just a no-op
-      return self.till(end_index).ptr[0..end_index];
-    }
-
     pub fn assertAligned(self: @This(), comptime new_alignment: std.mem.Alignment) if (new_alignment == _alignment) @This() else BytesExtra(new_alignment, _keep_len) {
       std.debug.assert(std.mem.isAligned(@intFromPtr(self.ptr), new_alignment.toByteUnits()));
       return .{ .ptr = @alignCast(self.ptr), .len = self.len };
