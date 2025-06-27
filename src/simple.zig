@@ -266,7 +266,7 @@ pub fn GetArrayMergedT(context: Context) type {
   @setEvalBranchQuota(1000_000);
   const ai = @typeInfo(T).array;
   // No need to .see(T) here as the child will handle this anyway and if the array type is repeated, the child will be too.
-  const Child = context.merge(context.realign(null).T(ai.child));
+  const Child = context.merge(context.T(ai.child));
 
   // If the child has no dynamic data, the entire array is static.
   // We can treat it as a direct memory copy.
@@ -279,7 +279,7 @@ pub fn GetArrayMergedT(context: Context) type {
       .T = T,
       .D = Child.Signature.D,
       .static_size = Child.Signature.static_size * ai.len,
-      .alignment = context.align_hint orelse .fromByteUnits(@alignOf(T)),
+      .alignment = Child.Signature.alignment,
     };
 
     pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {

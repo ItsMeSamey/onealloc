@@ -239,22 +239,8 @@ pub fn GetZstSliceMergedT(context: Context) type {
       return 0;
     }
 
-    const Self = @This();
-    pub const GS = struct {
-      len: *context.options.len_int,
-
-      pub const Parent = Self;
-      pub fn get(self: GS) context.options.len_int {
-        return self.len.*;
-      }
-
-      pub fn set(self: GS, val: *const T) void {
-        self.len.* = gl(val);
-      }
-    };
-
-    pub fn read(static: S, _: Signature.D) GS {
-      return .{ .len = @ptrCast(static.ptr) };
+    pub fn read(static: S, _: Signature.D) *context.options.len_int {
+      return @ptrCast(static.ptr);
     }
   };
 }
@@ -357,7 +343,7 @@ pub fn GetSliceMergedT(context: Context) type {
     }
 
     fn getStuff(dynamic: Signature.D, len: context.options.len_int) struct {
-      @"0": Bytes(Len.Signature.alignment),
+      @"0": Bytes(Index.Signature.alignment),
       @"1": Bytes(Child.Signature.alignment),
       @"2": Child.Signature.D,
     } {
@@ -370,18 +356,18 @@ pub fn GetSliceMergedT(context: Context) type {
         };
       }
       if (IndexBeforeStatic) {
-        const index_aligned = dynamic.alignForward(Len.Signature.alignment);
+        const index_aligned = dynamic.alignForward(Index.Signature.alignment);
         return .{
-          .@"0" = index_aligned.till(Len.Signature.static_size * (len - 1)),
-          .@"1" = index_aligned.from(Len.Signature.static_size * (len - 1)).assertAligned(.fromByteUnits(Child.Signature.D.alignment)).till(Child.Signature.static_size * len),
-          .@"2" = index_aligned.from(Len.Signature.static_size * (len - 1) + Child.Signature.static_size * len).alignForward(.fromByteUnits(Child.Signature.D.alignment)),
+          .@"0" = index_aligned.till(Index.Signature.static_size * (len - 1)),
+          .@"1" = index_aligned.from(Index.Signature.static_size * (len - 1)).assertAligned(.fromByteUnits(Child.Signature.D.alignment)).till(Child.Signature.static_size * len),
+          .@"2" = index_aligned.from(Index.Signature.static_size * (len - 1) + Child.Signature.static_size * len).alignForward(.fromByteUnits(Child.Signature.D.alignment)),
         };
       } else {
         const static_aligned = dynamic.alignForward(Child.Signature.alignment);
         return .{
-          .@"0" = dynamic.from(Child.Signature.static_size * len).assertAligned(.fromByteUnits(Len.Signature.alignment)).till(Len.Signature.static_size * (len - 1)),
+          .@"0" = dynamic.from(Child.Signature.static_size * len).assertAligned(.fromByteUnits(Index.Signature.alignment)).till(Index.Signature.static_size * (len - 1)),
           .@"1" = static_aligned.till(Child.Signature.static_size * len),
-          .@"2" = static_aligned.from(Len.Signature.static_size * (len - 1) + Child.Signature.static_size * len).alignForward(.fromByteUnits(Child.Signature.D.alignment)),
+          .@"2" = static_aligned.from(Index.Signature.static_size * (len - 1) + Child.Signature.static_size * len).alignForward(.fromByteUnits(Child.Signature.D.alignment)),
         };
       }
     }
@@ -404,7 +390,6 @@ pub fn GetSliceMergedT(context: Context) type {
         const item = &val.*[i];
 
         dwritten = std.mem.alignForward(context.options.offset_int, dwritten, Child.Signature.D.alignment);
-        child_dynamic = .alignForward(.fromByteUnits(Child.Signature.D.alignment));
         const written = Child.write(item, child_static, child_dynamic.from(dwritten).assertAligned(.fromByteUnits(Child.Signature.D.alignment)));
         if (builtin.mode == .Debug) {
           std.debug.assert(written == Child.getDynamicSize(item, @intFromPtr(child_dynamic.ptr) - @intFromPtr(child_dynamic.ptr)));
@@ -454,16 +439,19 @@ pub fn GetSliceMergedT(context: Context) type {
       }
 
       pub fn get(self: GS, i: context.options.offset_int) FnReturnType(Child.read) {
-        const index_offset = if (len == 1) 0 else Index.read(self._index, undefined);
-        return Child.read(
-          self._static.from(Child.Signature.static_size * i).assertAligned(.fromByteUnits(Child.Signature.alignment)),
-          self._dynamic.from(index_offset).assertAligned(.fromByteUnits(Child.Signature.D.alignment)),
-        );
+        const index_from = if (i == 0) 0 else Index.read(self._index.from(Index.Signature.static_size * (i - 1)).assertAligned(Index.Signature.alignment), undefined).*;
+        const index_till = if (!Child.Signature.D.need_len) {} else if (i == self.len() - 1) self._dynamic.len
+          else Index.read(self._index.from(Index.Signature.static_size * i).assertAligned(Index.Signature.alignment), undefined).*;
+
+        var dynamic = self._dynamic.from(index_from).assertAligned(.fromByteUnits(Child.Signature.D.alignment));
+        if (Child.Signature.D.need_len) dynamic = dynamic.till(index_till); // length needed
+
+        return Child.read(self._static.from(Child.Signature.static_size * i).assertAligned(.fromByteUnits(Child.Signature.alignment)), dynamic);
       }
 
       pub fn set(self: GS, i: context.options.offset_int, val: *const pi.child) void {
-        const index_offset = if (len == 1) 0
-          else Index.read(self._index.from(Index.Signature.static_size * (i - 1)).assertAligned(.fromByteUnits(Index.Signature.alignment)), undefined);
+        const index_offset = if (i == 1) 0
+          else Index.read(self._index.from(Index.Signature.static_size * (i - 1)).assertAligned(.fromByteUnits(Index.Signature.alignment)), undefined).*;
         const written = Child.write(
           val,
           self._static.from(Child.Signature.static_size * i).assertAligned(.fromByteUnits(Child.Signature.alignment)),
@@ -499,6 +487,138 @@ pub fn GetSliceMergedT(context: Context) type {
   if (!std.meta.hasFn(Retval.Child, "getDynamicSize")) return GetStaticSliceMergedT(context);
   if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
   return Retval;
+}
+
+pub fn GetArrayMergedT(context: Context) type {
+  const T = context.options.T;
+  const ai = @typeInfo(T).array;
+  const Child = context.merge(context.T(ai.child));
+
+  if (!std.meta.hasFn(Child, "getDynamicSize") or ai.len == 0) return GetDirectMergedT(context);
+  const Index = GetDirectMergedT(context.T(context.options.offset_int));
+  const IndexBeforeStatic = Index.Signature.alignment.toByteUnits() >= Child.Signature.alignment.toByteUnits();
+
+  return opaque {
+    const S = Bytes(Signature.alignment);
+
+    pub const Signature = MergedSignature{
+      .T = T,
+      .D = Child.Signature.D,
+      .static_size = Index.Signature.static_size * (ai.len - 1) + Child.Signature.static_size * ai.len,
+      .alignment = if (ai.len == 1) Child.Signature.alignment else .fromByteUnits(@max(Child.Signature.alignment.toByteUnits, Index.Signature.alignment.toByteUnits())),
+    };
+
+    fn getStuff(static: S) struct {
+      @"0": Bytes(Index.Signature.alignment),
+      @"1": Bytes(Child.Signature.alignment),
+    } {
+      if (ai.len == 1) {
+        return .{
+          .@"0" = undefined,
+          .@"1" = static.assertAligned(Child.Signature.alignment),
+        };
+      }
+      if (IndexBeforeStatic) {
+        return .{
+          .@"0" = static.till(Index.Signature.static_size * (ai.len - 1)),
+          .@"1" = static.from(Index.Signature.static_size * (ai.len - 1)).assertAligned(Child.Signature.alignment),
+        };
+      } else {
+        return .{
+          .@"0" = static.from(Child.Signature.static_size * ai.len).assertAligned(Index.Signature.alignment),
+          .@"1" = static.till(Child.Signature.static_size * ai.len),
+        };
+      }
+    }
+
+    pub fn write(val: *const T, static: S, _dynamic: Signature.D) usize {
+      const index, var child_static = getStuff(static);
+      var dynamic = _dynamic;
+      // First iteration
+      var dwritten: context.options.offset_int = @intCast(Child.write(&val[0], child_static, dynamic));
+      if (builtin.mode == .Debug) {
+        std.debug.assert(dwritten == Child.getDynamicSize(&val[0], @intFromPtr(dynamic.ptr) - @intFromPtr(_dynamic.ptr)));
+      }
+      child_static = child_static.from(Child.Signature.static_size).assertAligned(Child.Signature.alignment);
+
+      inline for (1..ai.len) |i| {
+        const item = &val[i];
+
+        dwritten = std.mem.alignForward(context.options.offset_int, dwritten, Child.Signature.D.alignment);
+        dynamic = dynamic.alignForward(.fromByteUnits(Child.Signature.D.alignment));
+        const written = Child.write(item, child_static, dynamic.from(dwritten).assertAligned(.fromByteUnits(Child.Signature.D.alignment)));
+        if (builtin.mode == .Debug) {
+          std.debug.assert(written == Child.getDynamicSize(item, @intFromPtr(dynamic.ptr) - @intFromPtr(_dynamic.ptr)));
+        }
+
+        std.debug.assert(0 == Index.write(&dwritten, index, undefined));
+        index = index.from(Index.Signature.static_size).assertAligned(Index.Signature.alignment);
+        child_static = child_static.from(Child.Signature.static_size).assertAligned(Child.Signature.alignment);
+        dwritten += @intCast(written);
+      }
+
+      return dwritten + @intFromPtr(dynamic.ptr) - @intFromPtr(_dynamic.ptr);
+    }
+
+    pub fn getDynamicSize(val: *const T, size: usize) usize {
+      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment));
+      var new_size = std.mem.alignForward(usize, size, S.alignment);
+      new_size += Index.Signature.static_size * (ai.len - 1) + Child.Signature.static_size * ai.len;
+
+      inline for (0..ai.len) |i| {
+        new_size = std.mem.alignForward(usize, new_size, Child.Signature.D.alignment);
+        new_size = Child.getDynamicSize(&val[i], new_size);
+      }
+
+      return new_size;
+    }
+
+    const Self = @This();
+    pub const GS = struct {
+      _offset: Bytes(Index.Signature.alignment),
+      _static: Bytes(Child.Signature.alignment),
+      _dynamic: Signature.D,
+
+      pub const Parent = Self;
+
+      pub fn get(self: GS, i: usize) FnReturnType(Child.read) {
+        if (i == 0) return Child.read(self._static, self._dynamic);
+        const offset_from = if (i == 1) 0 else Index.read(self._offset.from(Index.Signature.static_size * (i - 1)).assertAligned(Index.Signature.alignment), undefined).*;
+        const offset_till = if (!Child.Signature.D.need_len) {} else if (i == ai.len - 1) self._dynamic.len
+          else Index.read(self._offset.from(Index.Signature.static_size * i).assertAligned(Index.Signature.alignment), undefined).*;
+
+        var dynamic = self._dynamic.from(offset_from).assertAligned(.fromByteUnits(Child.Signature.D.alignment));
+        if (Child.Signature.D.need_len) dynamic = dynamic.till(offset_till); // length needed
+
+        return Child.read(self._static.from(Child.Signature.static_size * i).assertAligned(.fromByteUnits(Child.Signature.alignment)), dynamic);
+      }
+
+      /// WARNING: This set method is dangerous. It cannot handle cases where the new value has a different dynamic size than the old one
+      pub fn set(self: GS, i: context.options.offset_int, val: *const pi.child) void {
+        const index_offset = if (i == 1) 0
+          else Index.read(self._index.from(Index.Signature.static_size * (i - 1)).assertAligned(.fromByteUnits(Index.Signature.alignment)), undefined).*;
+        const written = Child.write(
+          val,
+          self._static.from(Child.Signature.static_size * i).assertAligned(.fromByteUnits(Child.Signature.alignment)),
+          self._dynamic.from(index_offset).assertAligned(.fromByteUnits(Child.Signature.D.alignment)),
+        );
+
+        if (builtin.mode == .Debug) {
+          const dynamic_len = (if (i == self.len() - 1) self._dynamic.len
+            else Index.read(self._index.from(Index.Signature.static_size * i).assertAligned(.fromByteUnits(Index.Signature.alignment)), undefined)) - index_offset;
+          if (Child.Signature.D.need_len) {
+            std.debug.assert(written == dynamic_len); // Cant change offsets if child type requires dynamic data size as well
+          } else {
+            std.debug.assert(written <= dynamic_len); // Cant overwrite beyond the max dynamic data size
+          }
+        }
+      }
+    };
+
+    pub fn read(static: S, dynamic: Signature.D) GS {
+      return .{ ._static = static, ._dynamic = dynamic };
+    }
+  };
 }
 
 pub fn ToMergedT(context: Context) type {
