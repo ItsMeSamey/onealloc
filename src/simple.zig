@@ -365,12 +365,67 @@ pub fn GetStructMergedT(context: Context) type {
           .static_offset = @offsetOf(T, f.name),
         };
       }
+
+      std.sort.pdqContext(0, pfields.len, struct {
+        fields: []ProcessedField,
+
+        fn greaterThan(self: @This(), lhs: usize, rhs: usize) bool {
+          const ls = self.fields[lhs].merged.Signature;
+          const rs = self.fields[rhs].merged.Signature;
+
+          if (!std.meta.hasFn(self.fields[lhs].merged, "getDynamicSize")) return false;
+          if (!std.meta.hasFn(self.fields[rhs].merged, "getDynamicSize")) return true;
+
+          if (ls.D.alignment != rs.D.alignment) return ls.D.alignment > rs.D.alignment;
+          if (ls.D.alignment != 1) return false;
+
+          comptime var lst = @typeInfo(ls.T);
+          comptime var rst = @typeInfo(rs.T);
+
+          if ((lst == .optional or lst == .pointer) and (rst == .optional or rst == .pointer)) {
+            if (lst == .optional) lst = @typeInfo(lst.optional.child);
+            if (rst == .optional) rst = @typeInfo(rst.optional.child);
+          } else if (lst == .optional or rst == .optional) {
+            return lst != .optional;
+          }
+
+          if (lst == .pointer and rst == .pointer) {
+            if (lst.pointer.size != rst.pointer.size) {
+              const lsize = lst.pointer.size;
+              const rsize = rst.pointer.size;
+              if (lsize == .one) return true;
+              if (rsize == .one) return false;
+
+              if (lsize == .slice) return true;
+              if (rsize == .slice) return false;
+
+              return false;
+            } else {
+              return @alignOf(lst.pointer.child) > @alignOf(rst.pointer.child);
+            }
+          } else if (lst == .pointer or rst == .pointer) {
+            if (lst == .pointer) return lst.pointer.size != .slice and @alignOf(lst.pointer.child) > @alignOf(rst.pointer.child);
+            return rst.pointer.size == .slice or @alignOf(lst.pointer.child) > @alignOf(rst.pointer.child);
+          }
+
+          return false;
+        }
+
+        pub const lessThan = greaterThan;
+
+        pub fn swap(self: @This(), lhs: usize, rhs: usize) void {
+          const temp = self.fields[lhs];
+          self.fields[lhs] = self.fields[rhs];
+          self.fields[rhs] = temp;
+        }
+      }{ .fields = &pfields });
+
       break :blk pfields;
     };
 
     const FirstNonStaticT = blk: {
       for (fields, 0..) |f, i| if (std.meta.hasFn(f.merged, "getDynamicSize")) break :blk i;
-      break :blk si.fields.len;
+      break :blk fields.len;
     };
 
     const S = Bytes(Signature.alignment);
@@ -445,11 +500,10 @@ pub fn GetStructMergedT(context: Context) type {
 
       return dynamic_offset;
     }
-
   };
 
   if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
-  if (Retval.FirstNonStaticT == si.fields.len) return GetDirectMergedT(context);
+  if (Retval.FirstNonStaticT == Retval.fields.len) return GetDirectMergedT(context);
   if (si.layout == .@"packed") @compileError("Packed structs with dynamic data are not supported");
   return Retval;
 }
