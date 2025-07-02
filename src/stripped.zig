@@ -188,7 +188,7 @@ pub fn GetPointerMergedT(context: Context) type {
       _dynamic: Child.Signature.D,
 
       pub const Parent = Self;
-      pub fn get(self: GS) if (is_optional) FnReturnType(Child.read) {
+      pub fn get(self: GS) if (is_optional) FnReturnType(@TypeOf(Child.read)) {
         if (is_optional and self._static.len == 0) return null;
 
         return Child.read(self._static, self._dynamic);
@@ -438,7 +438,7 @@ pub fn GetSliceMergedT(context: Context) type {
         self._len.* = v;
       }
 
-      pub fn get(self: GS, i: context.options.offset_int) FnReturnType(Child.read) {
+      pub fn get(self: GS, i: context.options.offset_int) FnReturnType(@TypeOf(Child.read)) {
         const index_from = if (i == 0) 0 else Index.read(self._index.from(Index.Signature.static_size * (i - 1)).assertAligned(Index.Signature.alignment), undefined).*;
         const index_till = if (!Child.Signature.D.need_len) {} else if (i == self.len() - 1) self._dynamic.len
           else Index.read(self._index.from(Index.Signature.static_size * i).assertAligned(Index.Signature.alignment), undefined).*;
@@ -580,7 +580,7 @@ pub fn GetArrayMergedT(context: Context) type {
 
       pub const Parent = Self;
 
-      pub fn get(self: GS, i: usize) FnReturnType(Child.read) {
+      pub fn get(self: GS, i: usize) FnReturnType(@TypeOf(Child.read)) {
         if (i == 0) return Child.read(self._static, self._dynamic);
         const offset_from = if (i == 0) 0 else Index.read(self._index.from(Index.Signature.static_size * (i - 1)).assertAligned(Index.Signature.alignment), undefined).*;
         const offset_till = if (!Child.Signature.D.need_len) {} else if (i == ai.len - 1) self._dynamic.len
@@ -619,6 +619,282 @@ pub fn GetArrayMergedT(context: Context) type {
       return .{ ._index = index, ._static = child_static, ._dynamic = dynamic };
     }
   };
+}
+
+pub fn GetStructMergedT(context: Context) type {
+  const T = context.options.T;
+  if (!context.options.recurse) return GetDirectMergedT(context);
+
+  const si = @typeInfo(T).@"struct";
+  const Retval = opaque {
+    const next_context = context.see(T, @This());
+
+    const S = Bytes(Signature.alignment);
+    pub const Signature = MergedSignature{
+      .T = T,
+      .D = (if (fields[last_dynamic_field].merged.Signature.D.need_len) BytesLen else Bytes)(.fromByteUnits(fields[first_dynamic_field].merged.Signature.D.alignment)),
+      .static_size = @sizeOf(T),
+      .alignment = context.align_hint orelse .fromByteUnits(@alignOf(T)),
+    };
+
+    const Self = @This();
+    const SD = struct {
+      _static: S,
+      _dynamic: Signature.D,
+      comptime Parent: type = Self,
+    };
+
+    const ProcessedField = struct {
+      /// original field
+      original: std.builtin.Type.StructField,
+      /// the merged type
+      merged: type,
+      /// is this field dynamic
+      is_dynamic: bool,
+      /// is this field an offset field
+      is_offset: bool,
+
+      pub fn sized(self: @This()) std.builtin.Type.StructField {
+        return .{
+          .name = self.original.name,
+          .type = [self.merged.Signature.static_size]u8,
+          .alignment = self.original.alignment,
+          .default_value_ptr = null,
+          .is_comptime = false,
+        };
+      }
+
+      pub fn wrapped(self: @This(), index: comptime_int) std.builtin.Type.StructField {
+        std.debug.assert(!self.is_offset);
+        return .{
+          .name = self.original.name,
+          .type = struct {
+            fn getSD(me: *const @This()) struct { _static: Bytes(self.merged.Signature.alignment), _dynamic: if (self.is_dynamic) self.merged.Signature.D else void } {
+              const parent_ptr: *const RetTypeStruct = @fieldParentPtr(self.original.name, me);
+              const sd = @field(parent_ptr, "\x00offset\xff");
+              const static = sd.static.from(@offsetOf(RetTypeStruct, self.original.name)).assertAligned(self.merged.Signature.alignment);
+              if (!self.is_dynamic) return .{ ._static = static, ._dynamic = undefined };
+
+              const dynamic_from = sd.dynamic.from(@offsetOf(RetTypeStruct, self.original.name)).assertAligned(.fromByteUnits(self.merged.Signature.D.alignment));
+              if (!self.merged.Signature.D.need_len) return .{ ._static = static, ._dynamic = dynamic_from };
+
+              const next_index = comptime blk: {
+                for (index + 1 .. fields.len) |i| if (fields[i].is_dynamic) break :blk i;
+                break :blk fields.len;
+              };
+              if (next_index == fields.len) return .{ ._static = static, ._dynamic = dynamic_from };
+
+              const next_name = fields[next_index].original.name;
+              const dtill = @FieldType(RetTypeStruct, next_name).read(static.from(@offsetOf(OptimalLayoutStruct, "\x00offset\xff" ++ next_name)), undefined);
+              return .{ ._static = static, ._dynamic = dynamic_from.upto(dtill) };
+            }
+
+            pub fn read(me: *const @This()) FnReturnType(@TypeOf(self.merged.read)) {
+              const sd = getSD(me);
+              return self.merged.read(sd._static, sd._dynamic);
+            }
+          },
+          .alignment = self.original.alignment,
+          .default_value_ptr = null,
+          .is_comptime = false,
+        };
+      }
+    };
+
+    const fields = blk: {
+      var processed: []const ProcessedField = &.{};
+      var first = true;
+
+      for (si.fields) |f| {
+        std.debug.assert(!std.mem.startsWith(u8, f.name, "\x00offset\xff")); // This is not allowed
+        const merged_child = context.merge(next_context.realign(.fromByteUnits(f.alignment)).T(f.type));
+        const is_dynamic = std.meta.hasFn(merged_child, "getDynamicSize");
+        processed = processed ++ &[1]ProcessedField{.{
+          .original = f,
+          .merged = merged_child,
+          .is_dynamic = is_dynamic,
+          .is_offset = false,
+        }};
+        if (is_dynamic) {
+          const int_t = std.meta.Int(.unsigned, if (first) 0 else context.options.offset_int);
+          first = false;
+          processed = processed ++ &[1]ProcessedField{.{
+            .original = std.builtin.Type.StructField{
+              .name = "\x00offset\xff" ++ f.name,
+              .type = int_t,
+              .alignment = @alignOf(int_t),
+              .default_value_ptr = null,
+              .is_comptime = false,
+            },
+            .merged = context.merge(next_context.realign(null).T(int_t)),
+            .is_dynamic = false,
+            .is_offset = true,
+          }};
+        }
+      }
+
+      var processed_array: [processed.len]ProcessedField = undefined;
+      for (processed, 0..) |f, i| processed_array[i] = f;
+
+      std.sort.pdqContext(0, processed_array.len, struct {
+        fields: []ProcessedField,
+
+        fn greaterThan(self: @This(), lhs: usize, rhs: usize) bool {
+          const ls = self.fields[lhs].merged.Signature;
+          const rs = self.fields[rhs].merged.Signature;
+
+          if (!std.meta.hasFn(self.fields[lhs].merged, "getDynamicSize")) return false;
+          if (!std.meta.hasFn(self.fields[rhs].merged, "getDynamicSize")) return true;
+
+          if (ls.D.alignment != rs.D.alignment) return ls.D.alignment > rs.D.alignment;
+          if (ls.D.alignment != 1) return false;
+
+          comptime var lst = @typeInfo(ls.T);
+          comptime var rst = @typeInfo(rs.T);
+
+          if ((lst == .optional or lst == .pointer) and (rst == .optional or rst == .pointer)) {
+            if (lst == .optional) lst = @typeInfo(lst.optional.child);
+            if (rst == .optional) rst = @typeInfo(rst.optional.child);
+          } else if (lst == .optional or rst == .optional) {
+            return lst != .optional;
+          }
+
+          if (lst == .pointer and rst == .pointer) {
+            if (lst.pointer.size != rst.pointer.size) {
+              const lsize = lst.pointer.size;
+              const rsize = rst.pointer.size;
+              if (lsize == .one) return true;
+              if (rsize == .one) return false;
+
+              if (lsize == .slice) return true;
+              if (rsize == .slice) return false;
+
+              return false;
+            } else {
+              return @alignOf(lst.pointer.child) > @alignOf(rst.pointer.child);
+            }
+          } else if (lst == .pointer or rst == .pointer) {
+            if (lst == .pointer) return lst.pointer.size != .slice and @alignOf(lst.pointer.child) > @alignOf(rst.pointer.child);
+            return rst.pointer.size == .slice or @alignOf(lst.pointer.child) > @alignOf(rst.pointer.child);
+          }
+
+          return false;
+        }
+
+        pub const lessThan = greaterThan;
+
+        pub fn swap(self: @This(), lhs: usize, rhs: usize) void {
+          const temp = self.fields[lhs];
+          self.fields[lhs] = self.fields[rhs];
+          self.fields[rhs] = temp;
+        }
+      }{ .fields = &processed_array });
+
+      break :blk processed_array;
+    };
+
+    // we construct a struct with backing memory as array to get the optimal layout.
+    const OptimalLayoutStruct: type = blk: {
+      var fields_array: [fields.len]std.builtin.Type.StructField = undefined;
+      for (fields, 0..) |f, i| fields_array[i] = f.sized();
+      break :blk @Type(.{.@"struct" = .{
+        .layout = .auto,
+        .fields = &fields_array,
+        .decls = &.{},
+        .is_tuple = false,
+      }});
+    };
+
+    // this is the type return by read
+    const RetTypeStruct = blk: {
+      if (false) break :blk T;
+
+      var fields_array: [1 + si.fields.len]std.builtin.Type.StructField = undefined;
+      fields_array[0] = .{ // This field will contain static/dynmic pair
+        .name = "\x00offset\xff",
+        .type = SD,
+        .alignment = @alignOf(SD),
+        .default_value_ptr = null,
+        .is_comptime = false,
+      };
+
+      var i: usize = 1;
+      for (fields, 0..) |f, j| {
+        if (f.is_offset) continue;
+        fields_array[i] = f.wrapped(j);
+        i += 1;
+      }
+      break :blk @Type(.{.@"struct" = .{
+        .layout = .auto,
+        .fields = &fields_array,
+        .decls = &.{},
+        .is_tuple = false,
+      }});
+    };
+
+    const first_dynamic_field = blk: {
+      for (fields, 0..) |f, i| if (f.is_dynamic) break :blk i;
+      break :blk fields.len;
+    };
+
+    const last_dynamic_field = blk: {
+      for (0..fields.len) |i| if (fields[fields.len - 1 - i].is_dynamic) break :blk fields.len - 1 - i;
+      break :blk fields.len;
+    };
+
+    pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
+      var dwritten: context.options.offset_int = 0;
+      comptime var first = true;
+
+      inline for (fields) |f| {
+        if (f.is_offset) continue;
+        if (!f.is_dynamic) {
+          std.debug.assert(0 == f.merged.write(&@field(val.*, f.original.name), static.from(@offsetOf(OptimalLayoutStruct, f.name)), undefined));
+          continue;
+        }
+
+        if (first) {
+          first = false;
+        } else {
+          dwritten = std.mem.alignForward(usize, dwritten, f.merged.Signature.alignment.toByteUnits());
+        }
+
+        const child_dynamic = dynamic.from(dwritten).assertAligned(.fromByteUnits(f.merged.Signature.D.alignment));
+        const written = f.merged.write(&@field(val.*, f.original.name), static.from(@offsetOf(OptimalLayoutStruct, f.name)), child_dynamic);
+
+        const name = "\x00offset\xff" ++ f.original.name;
+        @FieldType(OptimalLayoutStruct, name).write(&dwritten, static.from(@offsetOf(OptimalLayoutStruct, name)), undefined);
+        dwritten += written;
+      }
+
+      return dwritten;
+    }
+
+    pub fn getDynamicSize(val: *const T, size: usize) usize {
+      std.debug.assert(std.mem.isAligned(size, Signature.D.alignment));
+      var new_size: usize = size;
+
+      inline for (fields) |f| {
+        if (!f.is_dynamic) continue;
+        new_size = std.mem.alignForward(usize, new_size, f.merged.Signature.D.alignment);
+        new_size = f.merged.getDynamicSize(&@field(val.*, f.original.name), new_size);
+      }
+
+      return new_size;
+    }
+
+    pub fn read(static: S, dynamic: Signature.D) RetTypeStruct {
+      var retval: RetTypeStruct = undefined;
+      @field(retval, "\x00offset\xff") = .{ ._static = static, ._dynamic = dynamic };
+      return retval;
+    }
+  };
+
+  // If no fields are dynamic, it's just a direct copy.
+  if (Retval.fields.len == si.fields.len) return GetDirectMergedT(context);
+  if (si.layout == .@"packed") @compileError("Packed structs with dynamic fields are not yet supported");
+  if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
+  return Retval;
 }
 
 pub fn ToMergedT(context: Context) type {

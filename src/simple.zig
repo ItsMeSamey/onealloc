@@ -345,15 +345,14 @@ pub fn GetStructMergedT(context: Context) type {
   if (!context.options.recurse) return GetDirectMergedT(context);
 
   const si = @typeInfo(T).@"struct";
+  const ProcessedField = struct {
+    original: std.builtin.Type.StructField,
+    merged: type,
+    static_offset: comptime_int,
+  };
 
   const Retval = opaque {
     const next_context = context.see(T, @This());
-
-    const ProcessedField = struct {
-      original: std.builtin.Type.StructField,
-      merged: type,
-      static_offset: usize,
-    };
 
     const fields = blk: {
       var pfields: [si.fields.len]ProcessedField = undefined;
