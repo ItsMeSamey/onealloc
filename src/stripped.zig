@@ -135,7 +135,7 @@ pub fn GetPointerMergedT(context: Context) type {
 
   const Retval = opaque {
     const next_context = context.realign(.fromByteUnits(pi.alignment)).see(T, @This());
-    const Child = context.merge(next_context.T(pi.child));
+    const Child = next_context.T(pi.child).merge();
     const SubStatic = !std.meta.hasFn(Child, "getDynamicSize");
 
     const S = Bytes(Signature.alignment);
@@ -325,7 +325,7 @@ pub fn GetSliceMergedT(context: Context) type {
       break :blk retval;
     };
 
-    const Child = context.merge(next_context.reop(next_options).T(pi.child));
+    const Child = next_context.reop(next_options).T(pi.child).merge();
     // we want to write the "more" aligned thing first
     const IndexBeforeStatic = Len.Signature.alignment.toByteUnits() >= Child.Signature.alignment.toByteUnits();
 
@@ -493,7 +493,7 @@ pub fn GetArrayMergedT(context: Context) type {
   @setEvalBranchQuota(1000_000);
   const T = context.options.T;
   const ai = @typeInfo(T).array;
-  const Child = context.merge(context.T(ai.child));
+  const Child = context.T(ai.child).merge();
 
   if (!std.meta.hasFn(Child, "getDynamicSize") or ai.len == 0) return GetDirectMergedT(context);
   const Index = GetDirectMergedT(context.T(context.options.offset_int));
@@ -622,6 +622,7 @@ pub fn GetArrayMergedT(context: Context) type {
 }
 
 pub fn GetStructMergedT(context: Context) type {
+  @setEvalBranchQuota(1000_000);
   const T = context.options.T;
   if (!context.options.recurse) return GetDirectMergedT(context);
 
@@ -707,7 +708,7 @@ pub fn GetStructMergedT(context: Context) type {
 
       for (si.fields) |f| {
         std.debug.assert(!std.mem.startsWith(u8, f.name, "\x00offset\xff")); // This is not allowed
-        const merged_child = context.merge(next_context.realign(.fromByteUnits(f.alignment)).T(f.type));
+        const merged_child = next_context.realign(.fromByteUnits(f.alignment)).T(f.type).merge();
         const is_dynamic = std.meta.hasFn(merged_child, "getDynamicSize");
         processed = processed ++ &[1]ProcessedField{.{
           .original = f,
@@ -726,7 +727,7 @@ pub fn GetStructMergedT(context: Context) type {
               .default_value_ptr = null,
               .is_comptime = false,
             },
-            .merged = context.merge(next_context.realign(null).T(int_t)),
+            .merged = next_context.realign(null).T(int_t).merge(),
             .is_dynamic = false,
             .is_offset = true,
           }};
@@ -895,6 +896,88 @@ pub fn GetStructMergedT(context: Context) type {
   if (si.layout == .@"packed") @compileError("Packed structs with dynamic fields are not yet supported");
   if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
   return Retval;
+}
+
+pub fn GetOptionalMergedT(context: Context) type {
+  const T = context.options.T;
+  const oi = @typeInfo(T).optional;
+
+  const Retval = opaque {
+    const next_context = context.T(union {
+      some: oi.child,
+      none: void,
+    });
+    const Sub = next_context.merge();
+
+    const S = Bytes(Signature.alignment);
+    pub const Signature = MergedSignature{
+      .T = T,
+      .D = if (Sub.Signature.D.need_len) BytesLen(.@"1") else Bytes(.@"1"),
+      .static_size = Sub.Signature.static_size,
+      .alignment = context.align_hint orelse .fromByteUnits(@alignOf(T)),
+    };
+
+    pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
+      const union_val: Sub = if (val.*) |payload_val| .{ .some = payload_val } else .{ .none = {} };
+      const written = Sub.write(&union_val, static, dynamic);
+      if (val.* == null) std.debug.assert(0 == written);
+      return written;
+    }
+
+    pub fn getDynamicSize(val: *const T, size: usize) usize {
+      const union_val: Sub = if (val.*) |payload_val| .{ .some = payload_val } else .{ .none = {} };
+      return Sub.getDynamicSize(&union_val, size);
+    }
+
+    pub fn read(static: S, dynamic: Signature.D) ?FnReturnType(@TypeOf(@FieldType(Sub, "some").read)) {
+      return switch (Sub.read(static, dynamic).get()) {
+        .some => |some| some,
+        .none => null,
+      };
+    }
+  };
+
+  if (!std.meta.hasFn(Retval.Child, "getDynamicSize")) return GetDirectMergedT(context);
+}
+
+pub fn GetErrorUnionMergedT(context: Context) type {
+  const T = context.options.T;
+  const ei = @typeInfo(T).error_union;
+
+  return opaque {
+    const next_context = context.T(union {
+      ok: ei.payload,
+      err: anyerror,
+    });
+    const Sub = next_context.merge();
+
+    const S = Bytes(Signature.alignment);
+    pub const Signature = MergedSignature{
+      .T = T,
+      .D = if (Sub.Signature.D.need_len) BytesLen(.@"1") else Bytes(.@"1"),
+      .static_size = Sub.Signature.static_size,
+      .alignment = context.align_hint orelse .fromByteUnits(@alignOf(T)),
+    };
+
+    pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
+      const union_val: Sub = if (val.*) |payload_val| .{ .ok = payload_val } else |e| .{ .err = e };
+      const written = Sub.write(&union_val, static, dynamic);
+      if (val.* == null) std.debug.assert(0 == written);
+      return written;
+    }
+
+    pub fn getDynamicSize(val: *const T, size: usize) usize {
+      const union_val: Sub = if (val.*) |payload_val| .{ .ok = payload_val } else |e| .{ .err = e };
+      return Sub.getDynamicSize(&union_val, size);
+    }
+
+    pub fn read(static: S, dynamic: Signature.D) ei.error_set!FnReturnType(@TypeOf(@FieldType(Sub, "ok").read)) {
+      return switch (Sub.read(static, dynamic).get()) {
+        .ok => |ok| ok,
+        .err => |err| err,
+      };
+    }
+  };
 }
 
 pub fn ToMergedT(context: Context) type {

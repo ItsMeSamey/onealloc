@@ -190,7 +190,7 @@ pub fn GetContext(Options: type) type {
     /// The options used by the merging function
     options: Options,
     /// The function that will be used to merge a type
-    merge: fn (context: @This()) type,
+    merge_fn: fn (context: @This()) type,
 
     pub fn init(options: Options, merge_fn: fn (context: @This()) type) type {
       const self = @This(){
@@ -199,10 +199,14 @@ pub fn GetContext(Options: type) type {
         .result_types = &.{},
         .options = options,
         .seen_recursive = -1,
-        .merge = merge_fn,
+        .merge_fn = merge_fn,
       };
 
       return self.merge(self);
+    }
+
+    pub fn merge(self: @This()) type {
+      return self.merge_fn(self);
     }
 
     pub fn realign(self: @This(), align_hint: ?std.mem.Alignment) @This() {
