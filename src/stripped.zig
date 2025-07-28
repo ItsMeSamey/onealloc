@@ -6,7 +6,7 @@ const simple = @import("simple.zig");
 const Bytes = meta.Bytes;
 const BytesLen = meta.BytesLen;
 const FnReturnType = meta.FnReturnType;
-const MergedSignature = simple.MergedSignature;
+const MergedSignature = meta.MergedSignature;
 pub const Context = meta.GetContext(ToMergedOptions);
 
 /// Options to control how merging of a type is performed
@@ -27,6 +27,8 @@ pub const ToMergedOptions = struct {
   /// eg.
   /// If we have [][]u8, and deslice = 1, we will write pointer+size of all the strings in this slice
   /// If we have [][]u8, and deslice = 2, we will write all the characters in this block
+  ///
+  /// WARNING: you probably should not turn this off
   deslice: comptime_int = 1024,
   /// Error if deslice = 0
   error_on_0_deslice: bool = true,
@@ -35,6 +37,7 @@ pub const ToMergedOptions = struct {
   allow_recursive_rereferencing: bool = false,
   /// Serialize unknown pointers (C / Many / opaque pointers) as usize. Make data non-portable.
   /// If you want to use just the pointer value for some reason and not what it is pointing to, consider using a fixed size int instead.
+  /// WARNING: This probably should be kept false
   serialize_unknown_pointer_as_usize: bool = false,
 };
 
@@ -189,7 +192,7 @@ pub fn GetPointerMergedT(context: Context) type {
       _dynamic: Child.Signature.D,
 
       pub const Parent = Self;
-      pub fn get(self: GS) if (is_optional) FnReturnType(@TypeOf(Child.read)) {
+      pub fn get(self: GS) FnReturnType(@TypeOf(Child.read)) {
         if (is_optional and self._static.len == 0) return null;
 
         return Child.read(self._static, self._dynamic);
@@ -201,9 +204,9 @@ pub fn GetPointerMergedT(context: Context) type {
       }
     };
 
-    pub fn read(_: S, dynamic: Signature.D) ?GS {
+    pub fn read(_: S, dynamic: Signature.D) if (is_optional) ?GS else GS {
       const aligned = if (is_optional) dynamic.alignForward(Child.Signature.alignment) else dynamic;
-      if (aligned.len == 0) return null;
+      if (is_optional and aligned.len == 0) return null;
       const child_static = aligned.till(Child.Signature.static_size);
       const child_dynamic = aligned.from(Child.Signature.static_size).alignForward(.fromByteUnits(Child.Signature.D.alignment));
       return .{ ._static = child_static, ._dynamic = child_dynamic };
@@ -275,7 +278,7 @@ pub fn GetStaticSliceMergedT(context: Context) type {
       if (slice.len == 0) return 0;
 
       const child_static = _dynamic.alignForward(.fromByteUnits(@alignOf(pi.child)));
-      const child_bytes = @as([*]align(@alignOf(pi.child)) u8, @ptrCast(slice.ptr))[0..@sizeOf(pi.child) * slice.len];
+      const child_bytes = @as([*]const align(@alignOf(pi.child)) u8, @ptrCast(slice.ptr))[0..@sizeOf(pi.child) * slice.len];
       @memcpy(child_static.slice(child_bytes.len), child_bytes);
 
       return @sizeOf(pi.child) * slice.len;
@@ -294,7 +297,7 @@ pub fn GetStaticSliceMergedT(context: Context) type {
     pub fn read(static: S, dynamic: Signature.D) T {
       if (is_optional and Existence.read(static, undefined) == 0) return null;
       const aligned_dynamic = std.mem.alignForward(usize, @intFromPtr(static.ptr), Signature.alignment.toByteUnits());
-      return @as([*]pi.child, @ptrCast(aligned_dynamic.ptr))[0..@sizeOf(pi.child) * dynamic.len];
+      return @as([*]pi.child, @ptrFromInt(aligned_dynamic))[0..@sizeOf(pi.child) * dynamic.len];
     }
   };
 }
@@ -1205,5 +1208,161 @@ pub fn ToMergedT(context: Context) type {
       @compileError("A non-mergeable opaque " ++ @typeName(T) ++ " was provided to `ToMergedT`\n");
     },
   };
+}
+
+// ========================================
+//                 Testing                 
+// ========================================
+
+const testing = std.testing;
+const expectEqual = @import("testing.zig").expectEqual;
+
+/// Recursively compares an original value with the accessor struct returned by `read()`.
+fn expectEqualRead(expected: anytype, reader: anytype) !void {
+  const print = std.debug.print;
+
+  const rhs = switch (@typeInfo(@TypeOf(reader))) {
+    .@"opaque" => {},
+    .@"pointer" => |pi| switch (pi.size) {
+      .one => reader.*,
+      else => reader,
+    },
+    else => reader,
+  };
+
+  if (@TypeOf(expected) == @TypeOf(rhs)) {
+    return expectEqual(expected, rhs);
+  } 
+
+  switch (@typeInfo(@TypeOf(expected))) {
+    .noreturn, .@"opaque", .frame, .@"anyframe", .void, .type, .bool, .int, .float,
+    .comptime_float, .comptime_int, .enum_literal, .@"enum", .@"fn", .error_set, .vector =>
+      @compileError("value of type " ++ @typeName(@TypeOf(reader)) ++ " encountered, expected " ++ @typeName(@TypeOf(expected))),
+
+    .pointer => |pointer| {
+      switch (pointer.size) {
+        .one => return expectEqualRead(expected.*, reader.get()),
+        .many, .c =>
+          @compileError("value of type " ++ @typeName(@TypeOf(reader)) ++ " encountered, expected " ++ @typeName(@TypeOf(expected))),
+        .slice => {
+          for (expected, 0..) |ve, i| {
+            expectEqual(ve, reader.get(i)) catch |e| {
+              print("index {d} incorrect. expected {any}, found {any}\n", .{ i, expected[i], reader.get(i) });
+              return e;
+            };
+          }
+        },
+      }
+    },
+
+    .array => {
+      for (expected, 0..) |ve, i| {
+        expectEqual(ve, reader.get(i)) catch |e| {
+          print("index {d} incorrect. expected {any}, found {any}\n", .{ i, expected[i], reader.get(i) });
+          return e;
+        };
+      }
+    },
+
+    .@"struct" => |struct_info| {
+      inline for (struct_info.fields) |field| {
+        try expectEqualRead(@field(expected, field.name), @field(reader, field.name).read());
+      }
+    },
+
+    .@"union" => |union_info| {
+      if (union_info.tag_type == null) @compileError("Unable to compare untagged union values for type " ++ @typeName(@TypeOf(reader)));
+      const actual = reader.get();
+      const Tag = std.meta.Tag(@TypeOf(expected));
+      const expectedTag = @as(Tag, expected);
+      const actualTag = @as(Tag, actual);
+
+      try expectEqual(expectedTag, actualTag);
+
+      switch (expected) {
+        inline else => |val, tag| try expectEqual(val, @field(actual, @tagName(tag)).read()),
+      }
+    },
+
+    .optional => {
+      const actual = reader.read();
+      if (expected) |expected_payload| {
+        if (actual) |actual_payload| {
+          try expectEqual(expected_payload, actual_payload);
+        } else {
+          print("expected {any}, found null\n", .{expected_payload});
+          return error.TestExpectedEqual;
+        }
+      } else {
+        if (actual) |actual_payload| {
+          print("expected null, found {any}\n", .{actual_payload});
+          return error.TestExpectedEqual;
+        }
+      }
+    },
+
+    .error_union => {
+      const actual = reader.read();
+      if (expected) |expected_payload| {
+        if (actual) |actual_payload| {
+          try expectEqual(expected_payload, actual_payload);
+        } else |actual_err| {
+          print("expected {any}, found {}\n", .{ expected_payload, actual_err });
+          return error.TestExpectedEqual;
+        }
+      } else |expected_err| {
+        if (actual) |actual_payload| {
+          print("expected {}, found {any}\n", .{ expected_err, actual_payload });
+          return error.TestExpectedEqual;
+        } else |actual_err| {
+          try expectEqual(expected_err, actual_err);
+        }
+      }
+    },
+
+    else => @compileError("Unsupported type in expectEqual: " ++ @typeName(@TypeOf(expected))),
+  }
+}
+
+/// Test helper to serialize a value and then verify it by reading it back.
+fn _testMergingReading(value: anytype, comptime options: ToMergedOptions) !void {
+  const MergedT = Context.init(options, ToMergedT);
+  const static_size = MergedT.Signature.static_size;
+  var buffer: [static_size + 8192]u8 = undefined; // Increased buffer for complex tests
+
+  const total_size = if (std.meta.hasFn(MergedT, "getDynamicSize")) MergedT.getDynamicSize(&value, static_size) else static_size;
+
+  if (total_size > buffer.len) {
+    std.log.err("Buffer too small for test. need {d}, have {d}. Type: {s}", .{ total_size, buffer.len, @typeName(@TypeOf(value)) });
+    return error.NoSpaceLeft;
+  }
+
+  const dynamic_from = std.mem.alignForward(usize, static_size, MergedT.Signature.D.alignment);
+  const written_dynamic_size = MergedT.write(&value, .initAssert(buffer[0..static_size]), .initAssert(buffer[dynamic_from..]));
+  try testing.expectEqual(total_size - dynamic_from, written_dynamic_size);
+
+  const reader = MergedT.read(.initAssert(buffer[0..static_size]), .initAssert(buffer[dynamic_from..][0..written_dynamic_size]));
+  try expectEqualRead(value, reader);
+}
+
+fn testMerging(value: anytype) !void {
+  try _testMergingReading(value, .{ .T = @TypeOf(value) });
+}
+
+test "primitives" {
+  try testMerging(@as(u32, 42));
+  try testMerging(@as(f64, 123.456));
+  try testMerging(@as(bool, true));
+  try testMerging(@as(void, {}));
+}
+
+test "pointers" {
+  var x: u64 = 12345;
+  try testMerging(&x);
+  try _testMergingReading(&x, .{ .T = *u64, .dereference = false });
+}
+
+test "slices" {
+  try testMerging(@as([]const u8, "hello zig"));
 }
 

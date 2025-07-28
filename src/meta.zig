@@ -202,7 +202,7 @@ pub fn GetContext(Options: type) type {
         .merge_fn = merge_fn,
       };
 
-      return self.merge(self);
+      return self.merge();
     }
 
     pub fn merge(self: @This()) type {
