@@ -1013,6 +1013,157 @@ pub fn GetErrorUnionMergedT(context: Context) type {
   };
 }
 
+pub fn GetUnionMergedT(context: Context) type {
+  @setEvalBranchQuota(1000_000);
+  const T = context.options.T;
+  const ui = @typeInfo(T).@"union";
+
+  const Retval = opaque {
+    const next_context = context.see(T, @This());
+
+    const S = Bytes(Signature.alignment);
+    pub const Signature = MergedSignature{
+      .T = T,
+      .D = (if (needs_len) BytesLen else Bytes)(.@"1"),
+      .static_size = @sizeOf(LayoutUnion),
+      .alignment = context.align_hint orelse .fromByteUnits(@alignOf(T)),
+    };
+
+    const ProcessedField = struct {
+      /// original field
+      original: std.builtin.Type.StructField,
+      /// the merged type
+      merged: type,
+      /// is this field dynamic
+      is_dynamic: bool,
+
+      pub fn sized(self: @This()) std.builtin.Type.StructField {
+        return .{
+          .name = self.original.name,
+          .type = [self.merged.Signature.static_size]u8,
+          .alignment = self.original.alignment,
+          .default_value_ptr = null,
+          .is_comptime = false,
+        };
+      }
+
+      pub fn wrapped(self: @This()) std.builtin.Type.StructField {
+        std.debug.assert(!self.is_offset);
+        return .{
+          .name = self.original.name,
+          .type = struct {
+            _static: Bytes(self.merged.Signature.alignment),
+            _dynamic: self.merged.Signature.D,
+
+            pub fn read(me: *const @This()) FnReturnType(@TypeOf(self.merged.read)) {
+              return self.merged.read(me._static, me._dynamic);
+            }
+          },
+          .alignment = self.original.alignment,
+          .default_value_ptr = null,
+          .is_comptime = false,
+        };
+      }
+    };
+
+    const fields = blk: {
+      var processed: []const ProcessedField = &.{};
+
+      for (ui.fields) |f| {
+        const merged_child = next_context.realign(.fromByteUnits(f.alignment)).T(f.type).merge();
+        const is_dynamic = std.meta.hasFn(merged_child, "getDynamicSize");
+        processed = processed ++ &[1]ProcessedField{.{
+          .original = f,
+          .merged = merged_child,
+          .is_dynamic = is_dynamic,
+        }};
+      }
+
+      break :blk processed;
+    };
+
+    const is_static = blk: {
+      for (fields) |f| if (f.is_dynamic) break :blk false;
+      break :blk true;
+    };
+
+    const needs_len = blk: {
+      for (fields) |f| if (f.merged.Signature.D.need_len) break :blk true;
+      break :blk false;
+    };
+
+    const LayoutUnion = blk: {
+      var fields_array: [fields.len]std.builtin.Type.StructField = undefined;
+      for (fields, 0..) |f, i| fields_array[i] = f.sized();
+      break :blk @Type(.{.@"union" = .{
+        .layout = .auto,
+        .fields = &fields_array,
+        .decls = &.{},
+        .is_tuple = false,
+      }});
+    };
+
+    // this is the type return by read
+    const RetTypeUnion = blk: {
+      if (false) break :blk T; // hack to make unions show their fields in lsp
+
+      var fields_array: [ui.fields.len]std.builtin.Type.StructField = undefined;
+      for (fields, 0..) |f, i| fields_array[i] = f.wrapped(i);
+      break :blk @Type(.{.@"union" = .{
+        .layout = .auto,
+        .fields = &fields_array,
+        .decls = &.{},
+        .is_tuple = false,
+      }});
+    };
+
+    pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
+      const active_tag = std.meta.activeTag(val.*);
+      inline for (fields) |f| {
+        if (!std.mem.eql(u8, f.original.name, @tagName(active_tag))) continue;
+        if (!f.is_dynamic) {
+          std.debug.assert(0 == f.merged.write(&@field(val.*, f.original.name), static, undefined));
+          return 0;
+        }
+
+        const child_dynamic = dynamic.alignForward(f.merged.Signature.D.alignment);
+        const written = f.merged.write(&@field(val.*, f.original.name), static, child_dynamic);
+
+        return written + @intFromPtr(child_dynamic.ptr) - @intFromPtr(dynamic.ptr);
+      }
+    }
+
+    pub fn getDynamicSize(val: *const T, size: usize) usize {
+      const active_tag = std.meta.activeTag(val.*);
+      inline for (fields) |f| {
+        if (!std.mem.eql(u8, f.original.name, @tagName(active_tag))) continue;
+        if (!f.is_dynamic) return size;
+
+        const child_dynamic = size.alignForward(f.merged.Signature.D.alignment);
+        return f.merged.getDynamicSize(&@field(val.*, f.original.name), child_dynamic);
+      }
+    }
+
+    pub fn read(static: S, dynamic: Signature.D) RetTypeUnion {
+      const val: LayoutUnion = @ptrCast(static.ptr);
+      const active_tag = std.meta.activeTag(val.*);
+      inline for (fields) |f| {
+        if (!std.mem.eql(u8, f.original.name, @tagName(active_tag))) continue;
+        const child_static_ptr = &@field(val, f.original.name);
+        const child_static = .{ .ptr = child_static_ptr, .len = static.len }; // The length of this is wrong but that should not be a problem
+        if (!f.is_dynamic) return @unionInit(RetTypeUnion, f.original.name, .{ ._static = static, ._dynamic = undefined });
+
+        const child_dynamic = dynamic.alignForward(f.merged.Signature.D.alignment);
+        return @unionInit(RetTypeUnion, f.original.name, .{ ._static = child_static, ._dynamic = child_dynamic });
+      }
+    }
+  };
+
+  if (Retval.is_static) return GetDirectMergedT(context);
+  if (ui.layout == .@"packed") @compileError("Packed unions with dynamic fields are not yet supported");
+  if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
+  return Retval;
+}
 
 pub fn ToMergedT(context: Context) type {
   const T = context.options.T;
