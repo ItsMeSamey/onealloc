@@ -33,7 +33,8 @@ pub const ToMergedOptions = struct {
   /// Allow for recursive re-referencing, eg. (A has ?*A), (A has ?*B, B has ?*A), etc.
   /// When this is false and the type is recursive, compilation will error
   allow_recursive_rereferencing: bool = false,
-  /// Serialize unknown pointers (C / Many / opaque pointers) as usize. Make data non-portable
+  /// Serialize unknown pointers (C / Many / opaque pointers) as usize. Make data non-portable.
+  /// If you want to use just the pointer value for some reason and not what it is pointing to, consider using a fixed size int instead.
   serialize_unknown_pointer_as_usize: bool = false,
 };
 
@@ -102,7 +103,7 @@ pub fn GetZstPointerMergedT(context: Context) type {
       pub const Parent = Self;
       pub fn get(self: GS) if (is_optional) ?pi.child else pi.child {
         if (is_optional and self._exists.* == 0) return null;
-        return undefined;
+        return undefined; // Zero sized type has no value so this should be ok.
       }
 
       pub fn set(self: GS, val: if (is_optional) ?*pi.child else *pi.child) void {
@@ -747,6 +748,7 @@ pub fn GetStructMergedT(context: Context) type {
           if (!std.meta.hasFn(self.fields[lhs].merged, "getDynamicSize")) return false;
           if (!std.meta.hasFn(self.fields[rhs].merged, "getDynamicSize")) return true;
 
+          // We ideally should not reorder fields based on if they contain usize or not for eg, but zig itself may do this so this should be ok.
           if (ls.D.alignment != rs.D.alignment) return ls.D.alignment > rs.D.alignment;
           if (ls.D.alignment != 1) return false;
 
@@ -808,7 +810,7 @@ pub fn GetStructMergedT(context: Context) type {
 
     // this is the type return by read
     const RetTypeStruct = blk: {
-      if (false) break :blk T;
+      if (false) break :blk T; // hack to make structs show their fields in lsp
 
       var fields_array: [1 + si.fields.len]std.builtin.Type.StructField = undefined;
       fields_array[0] = .{ // This field will contain static/dynmic pair
@@ -849,8 +851,10 @@ pub fn GetStructMergedT(context: Context) type {
 
       inline for (fields) |f| {
         if (f.is_offset) continue;
+        const child_static = static.from(@offsetOf(OptimalLayoutStruct, f.name)).assertAligned(f.merged.Signature.alignment);
         if (!f.is_dynamic) {
-          std.debug.assert(0 == f.merged.write(&@field(val.*, f.original.name), static.from(@offsetOf(OptimalLayoutStruct, f.name)), undefined));
+          std.debug.assert(0 == f.merged.write(&@field(val.*, f.original.name), child_static, undefined)
+          );
           continue;
         }
 
@@ -861,10 +865,11 @@ pub fn GetStructMergedT(context: Context) type {
         }
 
         const child_dynamic = dynamic.from(dwritten).assertAligned(.fromByteUnits(f.merged.Signature.D.alignment));
-        const written = f.merged.write(&@field(val.*, f.original.name), static.from(@offsetOf(OptimalLayoutStruct, f.name)), child_dynamic);
+        const written = f.merged.write(&@field(val.*, f.original.name), child_static, child_dynamic);
 
         const name = "\x00offset\xff" ++ f.original.name;
-        @FieldType(OptimalLayoutStruct, name).write(&dwritten, static.from(@offsetOf(OptimalLayoutStruct, name)), undefined);
+        const offset_t = @FieldType(OptimalLayoutStruct, name);
+        std.debug.assert(0 == offset_t.write(&dwritten, static.from(@offsetOf(OptimalLayoutStruct, name)).assertAligned(@alignOf(offset_t)), undefined));
         dwritten += written;
       }
 
@@ -892,7 +897,7 @@ pub fn GetStructMergedT(context: Context) type {
   };
 
   // If no fields are dynamic, it's just a direct copy.
-  if (Retval.fields.len == si.fields.len) return GetDirectMergedT(context);
+  if (Retval.first_dynamic_field == si.fields.len) return GetDirectMergedT(context);
   if (si.layout == .@"packed") @compileError("Packed structs with dynamic fields are not yet supported");
   if (Retval.next_context.seen_recursive >= 0) return context.result_types[Retval.next_context.seen_recursive];
   return Retval;
@@ -929,11 +934,25 @@ pub fn GetOptionalMergedT(context: Context) type {
       return Sub.getDynamicSize(&union_val, size);
     }
 
-    pub fn read(static: S, dynamic: Signature.D) ?FnReturnType(@TypeOf(@FieldType(Sub, "some").read)) {
-      return switch (Sub.read(static, dynamic).get()) {
-        .some => |some| some,
-        .none => null,
-      };
+    const Self = @This();
+    pub const GS = struct {
+      sub: Sub.GS,
+
+      pub const Parent = Self;
+      pub fn get(self: GS) ?FnReturnType(@TypeOf(@FieldType(Sub, "some").read)) {
+        return switch (self.sub.get()) {
+          .some => |some| some,
+          .none => null,
+        };
+      }
+
+      pub fn set(self: GS, val: *const T) void {
+        self.sub.set(if (val.*) |payload_val| .{ .some = payload_val } else .{ .none = {} });
+      }
+    };
+
+    pub fn read(static: S, dynamic: Signature.D) GS {
+      return .{ .sub = Sub.read(static, dynamic) };
     }
   };
 
@@ -971,14 +990,29 @@ pub fn GetErrorUnionMergedT(context: Context) type {
       return Sub.getDynamicSize(&union_val, size);
     }
 
-    pub fn read(static: S, dynamic: Signature.D) ei.error_set!FnReturnType(@TypeOf(@FieldType(Sub, "ok").read)) {
-      return switch (Sub.read(static, dynamic).get()) {
-        .ok => |ok| ok,
-        .err => |err| err,
-      };
+    const Self = @This();
+    pub const GS = struct {
+      sub: Sub.GS,
+
+      pub const Parent = Self;
+      pub fn get(self: GS) ei.error_set!FnReturnType(@TypeOf(@FieldType(Sub, "ok").read)) {
+        return switch (self.sub.get()) {
+          .ok => |ok| ok,
+          .err => |err| err,
+        };
+      }
+
+      pub fn set(self: GS, val: *const T) void {
+        self.sub.set(if (val.*) |payload_val| .{ .ok = payload_val } else |e| .{ .err = e });
+      }
+    };
+
+    pub fn read(static: S, dynamic: Signature.D) GS {
+      return .{ .sub = Sub.read(static, dynamic) };
     }
   };
 }
+
 
 pub fn ToMergedT(context: Context) type {
   const T = context.options.T;
