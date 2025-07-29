@@ -1403,3 +1403,27 @@ test "slices" {
   try testMerging(@as([]const []const u8, &.{"", "a", ""}));
 }
 
+test "arrays" {
+  try testMerging([4]u8{ 1, 2, 3, 4 });
+
+  const Point = struct { x: u8, y: u8 };
+  try testMerging([2]Point{ .{ .x = 1, .y = 2 }, .{ .x = 3, .y = 4 } });
+
+  try testMerging([2][2]u8{ .{ 1, 2 }, .{ 3, 4 } });
+
+  try testMerging([0]u8{});
+}
+
+test "structs" {
+  const Point = struct { x: i32, y: i32 };
+  try testMerging(Point{ .x = -10, .y = 20 });
+
+  const Line = struct { p1: Point, p2: Point };
+  try testMerging(Line{ .p1 = .{ .x = 1, .y = 2 }, .p2 = .{ .x = 3, .y = 4 } });
+}
+
+test "enums" {
+  const Color = enum { red, green, blue };
+  try testMerging(Color.green);
+}
+
