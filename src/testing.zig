@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn expectEqual(expected: anytype, actual: anytype) error{TestExpectedEqual}!void {
   const print = std.debug.print;
 
+  if (@TypeOf(actual) != @TypeOf(expected)) {
+    print("expected type {s}, found type {s}\n", .{ @typeName(expected), @typeName(actual) });
+    return error.TestExpectedEqual;
+  }
+
   switch (@typeInfo(@TypeOf(actual))) {
     .noreturn, .@"opaque", .frame, .@"anyframe", => @compileError("value of type " ++ @typeName(@TypeOf(actual)) ++ " encountered"),
 
