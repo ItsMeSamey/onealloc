@@ -1603,6 +1603,96 @@ test "slice of complex structs" {
     .{ .id = 3, .name = "", .is_active = true },
   };
 
-  try testMerging(items[0..]);
+  try testMerging(items[0..]); // this is taken to be an array pointer
+  try testMerging(@as([]const Item, items[0..]));
+}
+
+test "multiple dynamic fields" {
+  const MultiDynamic = struct {
+    a: []const u8,
+    b: i32,
+    c: []const u8,
+  };
+
+  var value = MultiDynamic{
+    .a = "hello",
+    .b = 12345,
+    .c = "world",
+  };
+  try testMerging(value);
+
+  value.a = "";
+  try testMerging(value);
+}
+
+test "complex array" {
+  const Struct = struct {
+    a: u8,
+    b: u32,
+  };
+  const value = [2]Struct{
+    .{ .a = 1, .b = 100 },
+    .{ .a = 2, .b = 200 },
+  };
+
+  try testMerging(value);
+}
+
+test "struct with zero-sized fields" {
+  const ZST_1 = struct {
+    a: u32,
+    b: void,
+    c: [0]u8,
+    d: []const u8,
+    e: bool,
+  };
+  try testMerging(ZST_1{
+    .a = 123,
+    .b = {},
+    .c = .{},
+    .d = "non-zst",
+    .e = false,
+  });
+
+  const ZST_2 = struct {
+    a: u32,
+    zst1: void,
+    zst_array: [0]u64,
+    dynamic_zst_slice: []const void,
+    zst_union: union(enum) {
+      z: void,
+      d: u64,
+    },
+    e: bool,
+  };
+
+  var value_2 = ZST_2{
+    .a = 123,
+    .zst1 = {},
+    .zst_array = .{},
+    .dynamic_zst_slice = &.{ {}, {}, {} },
+    .zst_union = .{ .z = {} },
+    .e = true,
+  };
+
+  try testMerging(value_2);
+
+  value_2.zst_union = .{ .d = 999 };
+  try testMerging(value_2);
+}
+
+test "slice of structs with dynamic fields" {
+  const LogEntry = struct {
+    timestamp: u64,
+    message: []const u8,
+  };
+  const entries = [_]LogEntry{
+    .{ .timestamp = 1, .message = "first entry" },
+    .{ .timestamp = 2, .message = "" },
+    .{ .timestamp = 3, .message = "third entry has a much longer message to test buffer allocation" },
+  };
+
+  try testMerging(entries[0..]); // this is taken to be an array pointer
+  try testMerging(@as([]const LogEntry, entries[0..]));
 }
 
