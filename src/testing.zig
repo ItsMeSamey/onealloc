@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn expectEqual(expected: anytype, actual: anytype) error{TestExpectedEqual}!void {
   const print = std.debug.print;
 
-  if (@TypeOf(actual) != @TypeOf(expected)) {
+  if (std.meta.activeTag(@typeInfo(@TypeOf(actual))) != std.meta.activeTag(@typeInfo(@TypeOf(expected)))) {
     print("expected type {s}, found type {s}\n", .{ @typeName(@TypeOf(expected)), @typeName(@TypeOf(actual)) });
     return error.TestExpectedEqual;
   }

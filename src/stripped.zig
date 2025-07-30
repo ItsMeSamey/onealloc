@@ -152,11 +152,10 @@ pub fn GetPointerMergedT(context: Context) type {
       const dynamic = if (is_optional) _dynamic.alignForward(Child.Signature.alignment) else _dynamic;
       const child_static = dynamic.till(Child.Signature.static_size);
       // Align 1 if child is static, so no issue here, static and dynamic children an be written by same logic
-      const _child_dynamic = dynamic.from(Child.Signature.static_size).alignForward(.fromByteUnits(Child.Signature.D.alignment));
-      const child_dynamic = if (@TypeOf(_child_dynamic).need_len and !Child.Signature.D.need_len) _child_dynamic.till(_child_dynamic.len) else _child_dynamic;
-      const written = Child.write(if (is_optional) val.*.? else val.*, child_static, child_dynamic);
+      const child_dynamic = dynamic.from(Child.Signature.static_size).alignForward(.fromByteUnits(Child.Signature.D.alignment));
+      const written = Child.write(if (is_optional) val.*.? else val.*, child_static, if (SubStatic) undefined else child_dynamic);
 
-      if (std.meta.hasFn(Child, "getDynamicSize") and builtin.mode == .Debug) {
+      if (!SubStatic and builtin.mode == .Debug) {
         std.debug.assert(written == Child.getDynamicSize(if (is_optional) val.*.? else val.*, @intFromPtr(child_dynamic.ptr)) - @intFromPtr(child_dynamic.ptr));
       } else {
         std.debug.assert(0 == written);
@@ -669,8 +668,8 @@ pub fn GetStructMergedT(context: Context) type {
     pub const Signature = MergedSignature{
       .T = T,
       .D = (if (fields[last_dynamic_field].merged.Signature.D.need_len) BytesLen else Bytes)(.fromByteUnits(fields[first_dynamic_field].merged.Signature.D.alignment)),
-      .static_size = @sizeOf(T),
-      .alignment = context.align_hint orelse .fromByteUnits(@alignOf(T)),
+      .static_size = @sizeOf(OptimalLayoutStruct),
+      .alignment = context.align_hint orelse .fromByteUnits(@alignOf(OptimalLayoutStruct)),
     };
 
     const Self = @This();
@@ -693,8 +692,8 @@ pub fn GetStructMergedT(context: Context) type {
       pub fn sized(self: @This()) std.builtin.Type.StructField {
         return .{
           .name = self.original.name,
-          .type = [self.merged.Signature.static_size]u8,
-          .alignment = self.original.alignment,
+          .type = if (self.is_offset) self.original.type else [self.merged.Signature.static_size]u8,
+          .alignment = self.merged.Signature.alignment.toByteUnits(),
           .default_value_ptr = null,
           .is_comptime = false,
         };
@@ -706,12 +705,14 @@ pub fn GetStructMergedT(context: Context) type {
           .name = self.original.name,
           .type = struct {
             fn getSD(me: *const @This()) struct { _static: Bytes(self.merged.Signature.alignment), _dynamic: if (self.is_dynamic) self.merged.Signature.D else void } {
-              const parent_ptr: *const RetTypeStruct = @fieldParentPtr(self.original.name, me);
+              const parent_ptr: *const RetTypeStruct = @alignCast(@fieldParentPtr(self.original.name, me));
               const sd = @field(parent_ptr, "\x00offset\xff");
-              const static = sd.static.from(@offsetOf(RetTypeStruct, self.original.name)).assertAligned(self.merged.Signature.alignment);
+              const layout_struct: *const OptimalLayoutStruct = @ptrCast(sd._static.ptr);
+
+              const static = sd._static.from(@offsetOf(OptimalLayoutStruct, self.original.name)).assertAligned(self.merged.Signature.alignment);
               if (!self.is_dynamic) return .{ ._static = static, ._dynamic = undefined };
 
-              const dynamic_from = sd.dynamic.from(@offsetOf(RetTypeStruct, self.original.name)).assertAligned(.fromByteUnits(self.merged.Signature.D.alignment));
+              const dynamic_from = sd._dynamic.from(@field(layout_struct, "\x00offset\xff" ++ self.original.name)).assertAligned(.fromByteUnits(self.merged.Signature.D.alignment));
               if (!self.merged.Signature.D.need_len) return .{ ._static = static, ._dynamic = dynamic_from };
 
               const next_index = comptime blk: {
@@ -720,14 +721,12 @@ pub fn GetStructMergedT(context: Context) type {
               };
               if (next_index == fields.len) return .{ ._static = static, ._dynamic = dynamic_from };
 
-              const next_name = fields[next_index].original.name;
-              const dtill = @FieldType(RetTypeStruct, next_name).read(static.from(@offsetOf(OptimalLayoutStruct, "\x00offset\xff" ++ next_name)), undefined);
-              return .{ ._static = static, ._dynamic = dynamic_from.upto(dtill) };
+              return .{ ._static = static, ._dynamic = dynamic_from.upto(@field(layout_struct, "\x00offset\xff" ++ fields[next_index].original.name)) };
             }
 
             pub fn read(me: *const @This()) FnReturnType(@TypeOf(self.merged.read)) {
               const sd = getSD(me);
-              return self.merged.read(sd._static, sd._dynamic);
+              return self.merged.read(sd._static, if (self.is_dynamic) sd._dynamic else undefined);
             }
           },
           .alignment = self.original.alignment,
@@ -739,7 +738,6 @@ pub fn GetStructMergedT(context: Context) type {
 
     const fields = blk: {
       var processed: []const ProcessedField = &.{};
-      var first = true;
 
       for (si.fields) |f| {
         std.debug.assert(!std.mem.startsWith(u8, f.name, "\x00offset\xff")); // This is not allowed
@@ -752,17 +750,15 @@ pub fn GetStructMergedT(context: Context) type {
           .is_offset = false,
         }};
         if (is_dynamic) {
-          const int_t = std.meta.Int(.unsigned, if (first) 0 else context.options.offset_int);
-          first = false;
           processed = processed ++ &[1]ProcessedField{.{
             .original = std.builtin.Type.StructField{
               .name = "\x00offset\xff" ++ f.name,
-              .type = int_t,
-              .alignment = @alignOf(int_t),
+              .type = context.options.offset_int,
+              .alignment = @alignOf(context.options.offset_int),
               .default_value_ptr = null,
               .is_comptime = false,
             },
-            .merged = next_context.realign(null).T(int_t).merge(),
+            .merged = next_context.realign(null).T(context.options.offset_int).merge(),
             .is_dynamic = false,
             .is_offset = true,
           }};
@@ -827,6 +823,17 @@ pub fn GetStructMergedT(context: Context) type {
         }
       }{ .fields = &processed_array });
 
+      for (processed_array) |f1| {
+        if (!f1.is_dynamic) continue;
+        for (processed_array, 0..) |f2, i| {
+          if (!f2.is_offset) continue;
+          if (!std.mem.eql(u8, "\x00offset\xff" ++ f1.original.name, f2.original.name)) continue;
+          processed_array[i].original.type = u0;
+          break;
+        }
+        break;
+      }
+
       break :blk processed_array;
     };
 
@@ -880,31 +887,31 @@ pub fn GetStructMergedT(context: Context) type {
     };
 
     pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
+      const layout_struct: *OptimalLayoutStruct = @ptrCast(static.ptr);
       var dwritten: context.options.offset_int = 0;
-      comptime var first = true;
 
       inline for (fields) |f| {
         if (f.is_offset) continue;
-        const child_static = static.from(@offsetOf(OptimalLayoutStruct, f.name)).assertAligned(f.merged.Signature.alignment);
+        const child_static = static.from(@offsetOf(OptimalLayoutStruct, f.original.name)).assertAligned(f.merged.Signature.alignment);
         if (!f.is_dynamic) {
-          std.debug.assert(0 == f.merged.write(&@field(val.*, f.original.name), child_static, undefined)
-          );
+          std.debug.assert(0 == f.merged.write(&@field(val.*, f.original.name), child_static, undefined));
           continue;
         }
 
-        if (first) {
-          first = false;
-        } else {
-          dwritten = std.mem.alignForward(usize, dwritten, f.merged.Signature.alignment.toByteUnits());
-        }
-
+        dwritten = std.mem.alignForward(context.options.offset_int, dwritten, @intCast(f.merged.Signature.D.alignment));
         const child_dynamic = dynamic.from(dwritten).assertAligned(.fromByteUnits(f.merged.Signature.D.alignment));
         const written = f.merged.write(&@field(val.*, f.original.name), child_static, child_dynamic);
 
-        const name = "\x00offset\xff" ++ f.original.name;
-        const offset_t = @FieldType(OptimalLayoutStruct, name);
-        std.debug.assert(0 == offset_t.write(&dwritten, static.from(@offsetOf(OptimalLayoutStruct, name)).assertAligned(@alignOf(offset_t)), undefined));
-        dwritten += written;
+        if (@FieldType(OptimalLayoutStruct, "\x00offset\xff" ++ f.original.name) == u0) {
+          if (0 != dwritten) {
+            std.debug.panic("Offset field {s} is not at the beginning of the struct", .{f.original.name});
+            unreachable;
+          }
+        } else {
+          @field(layout_struct, "\x00offset\xff" ++ f.original.name) = dwritten;
+        }
+
+        dwritten += @intCast(written);
       }
 
       return dwritten;
@@ -1364,16 +1371,17 @@ fn _testMergingReading(value: anytype, comptime options: ToMergedOptions) !void 
   const static_size = MergedT.Signature.static_size;
   var buffer: [static_size + 8192]u8 = undefined; // Increased buffer for complex tests
 
-  const total_size = static_size + if (std.meta.hasFn(MergedT, "getDynamicSize")) MergedT.getDynamicSize(&value, 0) else 0;
+  const dynamic_size = if (std.meta.hasFn(MergedT, "getDynamicSize")) MergedT.getDynamicSize(&value, 0) else 0;
+  const dynamic_from = std.mem.alignForward(usize, static_size, MergedT.Signature.D.alignment);
+  const total_size = dynamic_from + dynamic_size;
 
   if (total_size > buffer.len) {
     std.log.err("Buffer too small for test. need {d}, have {d}. Type: {s}", .{ total_size, buffer.len, @typeName(@TypeOf(value)) });
     return error.NoSpaceLeft;
   }
 
-  const dynamic_from = std.mem.alignForward(usize, static_size, MergedT.Signature.D.alignment);
   const written_dynamic_size = MergedT.write(&value, .initAssert(buffer[0..static_size]), .initAssert(buffer[dynamic_from..]));
-  try testing.expectEqual(total_size - dynamic_from, written_dynamic_size);
+  try testing.expectEqual(dynamic_size, written_dynamic_size);
 
   // std.debug.print("written_len: {any}\n", .{written_dynamic_size});
   const reader = MergedT.read(.initAssert(buffer[0..static_size]), .initAssert(buffer[dynamic_from..dynamic_from + written_dynamic_size]));
@@ -1465,5 +1473,36 @@ test "unions" {
   try testMerging(Payload{ .a = 99 });
   try testMerging(Payload{ .b = false });
   try testMerging(Payload{ .c = {} });
+}
+
+test "complex struct" {
+  const Nested = struct {
+    c: u4,
+    d: bool,
+  };
+
+  const KitchenSink = struct {
+    a: i32,
+    b: []const u8,
+    c: [2]Nested,
+    d: ?*const i32,
+    e: f32,
+  };
+
+  var value = KitchenSink{
+    .a = -1,
+    .b = "dynamic slice",
+    .c = .{ .{ .c = 1, .d = true }, .{ .c = 2, .d = false } },
+    .d = &@as(i32, 42),
+    .e = 3.14,
+  };
+
+  try testMerging(value);
+
+  value.b = "";
+  try testMerging(value);
+
+  value.d = null;
+  try testMerging(value);
 }
 
