@@ -140,7 +140,7 @@ pub fn GetPointerMergedT(context: Context) type {
     const S = Bytes(Signature.alignment);
     pub const Signature = MergedSignature{
       .T = T,
-      .D = (if (is_optional or Child.Signature.D.need_len) BytesLen else Bytes)(if (is_optional) .@"1" else .fromByteUnits(pi.alignment)),
+      .D = (if (is_optional or Child.Signature.D.need_len) BytesLen else Bytes)(if (is_optional) .@"1" else Child.Signature.alignment),
       .static_size = Existence.Signature.static_size,
       .alignment = .@"1",
     };
@@ -368,7 +368,7 @@ pub fn GetSliceMergedT(context: Context) type {
       }
       if (IndexBeforeStatic) {
         const index_aligned = dynamic.alignForward(Index.Signature.alignment);
-        const child_static = index_aligned.from(Index.Signature.static_size * (len - 1)).assertAligned(.fromByteUnits(Child.Signature.D.alignment));
+        const child_static = index_aligned.from(Index.Signature.static_size * (len - 1)).assertAligned(Child.Signature.alignment);
         const child_dynamic = child_static.from(Child.Signature.static_size * len).alignForward(.fromByteUnits(Child.Signature.D.alignment));
         return .{
           .index = index_aligned.till(Index.Signature.static_size * (len - 1)),
@@ -407,14 +407,16 @@ pub fn GetSliceMergedT(context: Context) type {
       for (1..len) |i| {
         const item = &val.*[i];
 
-        dwritten = std.mem.alignForward(context.options.offset_int, dwritten, Child.Signature.D.alignment);
+        if (comptime !Child.Signature.D.need_len) dwritten = std.mem.alignForward(context.options.offset_int, dwritten, Child.Signature.D.alignment);
+        std.debug.assert(0 == Index.write(&dwritten, index, undefined));
+        index = index.from(Index.Signature.static_size).assertAligned(Index.Signature.alignment);
+        if (comptime Child.Signature.D.need_len) dwritten = std.mem.alignForward(context.options.offset_int, dwritten, Child.Signature.D.alignment);
+
         const written = Child.write(item, child_static, child_dynamic.from(dwritten).assertAligned(.fromByteUnits(Child.Signature.D.alignment)));
         if (builtin.mode == .Debug) {
           std.debug.assert(written == Child.getDynamicSize(item, @intFromPtr(child_dynamic.ptr) - @intFromPtr(child_dynamic.ptr)));
         }
 
-        std.debug.assert(0 == Index.write(&dwritten, index, undefined));
-        index = index.from(Index.Signature.static_size).assertAligned(Index.Signature.alignment);
         child_static = child_static.from(Child.Signature.static_size).assertAligned(Child.Signature.alignment);
         dwritten += @intCast(written);
       }
@@ -470,16 +472,17 @@ pub fn GetSliceMergedT(context: Context) type {
       }
 
       pub fn get(self: GS, i: context.options.offset_int) FnReturnType(@TypeOf(Child.read)) {
-        const child_static = self._static.from(Child.Signature.static_size * i).assertAligned(Child.Signature.alignment);
-        const _dynamic = if (!Child.Signature.D.need_len) self._dynamic else self._dynamic.upto(
+        const _child_dynamic = if (!Child.Signature.D.need_len) self._dynamic else self._dynamic.upto(
           if (i == self.len() - 1) self._dynamic.len
           else Index.read(self._index.from(Index.Signature.static_size * i).assertAligned(Index.Signature.alignment), undefined).*
         );
 
-        const index_from = if (i == 0) 0 else Index.read(self._index.from(Index.Signature.static_size * (i - 1)).assertAligned(Index.Signature.alignment), undefined).*;
-        const child_dynamic = _dynamic.from(index_from).assertAligned(.fromByteUnits(Child.Signature.D.alignment));
+        const index_from_misaligned = if (i == 0) 0 else Index.read(self._index.from(Index.Signature.static_size * (i - 1)).assertAligned(Index.Signature.alignment), undefined).*;
+        const index_from = if (comptime Child.Signature.D.need_len)
+          std.mem.alignForward(context.options.offset_int, index_from_misaligned, @intCast(Child.Signature.D.alignment));
 
-        return Child.read(child_static, child_dynamic);
+        const child_dynamic = _child_dynamic.from(index_from).assertAligned(.fromByteUnits(Child.Signature.D.alignment));
+        return Child.read(self._static.from(Child.Signature.static_size * i).assertAligned(Child.Signature.alignment), child_dynamic);
       }
 
       pub fn set(self: GS, i: context.options.offset_int, val: *const pi.child) void {
@@ -530,7 +533,7 @@ pub fn GetArrayMergedT(context: Context) type {
   const Child = context.T(ai.child).merge();
 
   if (!std.meta.hasFn(Child, "getDynamicSize") or ai.len == 0) return GetDirectMergedT(context);
-  const Index = GetDirectMergedT(context.T(context.options.offset_int));
+  const Index = GetDirectMergedT(context.realign(null).T(context.options.offset_int));
   const IndexBeforeStatic = Index.Signature.alignment.toByteUnits() >= Child.Signature.alignment.toByteUnits();
 
   return opaque {
@@ -540,34 +543,36 @@ pub fn GetArrayMergedT(context: Context) type {
       .T = T,
       .D = Child.Signature.D,
       .static_size = Index.Signature.static_size * (ai.len - 1) + Child.Signature.static_size * ai.len,
-      .alignment = if (ai.len == 1) Child.Signature.alignment else .fromByteUnits(@max(Child.Signature.alignment.toByteUnits, Index.Signature.alignment.toByteUnits())),
+      .alignment = if (ai.len == 1) Child.Signature.alignment else .fromByteUnits(@max(Child.Signature.alignment.toByteUnits(), Index.Signature.alignment.toByteUnits())),
     };
 
     fn getStuff(static: S) struct {
-      @"0": if (ai.len == 1) void else Bytes(Index.Signature.alignment),
-      @"1": Bytes(Child.Signature.alignment),
+      index: if (ai.len == 1) void else Bytes(Index.Signature.alignment),
+      child_static: Bytes(Child.Signature.alignment),
     } {
       if (ai.len == 1) {
         return .{
-          .@"0" = undefined,
-          .@"1" = static.assertAligned(Child.Signature.alignment),
+          .index = undefined,
+          .child_static = static.assertAligned(Child.Signature.alignment),
         };
       }
       if (IndexBeforeStatic) {
         return .{
-          .@"0" = static.till(Index.Signature.static_size * (ai.len - 1)),
-          .@"1" = static.from(Index.Signature.static_size * (ai.len - 1)).assertAligned(Child.Signature.alignment),
+          .index = static.till(Index.Signature.static_size * (ai.len - 1)),
+          .child_static = static.from(Index.Signature.static_size * (ai.len - 1)).assertAligned(Child.Signature.alignment),
         };
       } else {
         return .{
-          .@"0" = static.from(Child.Signature.static_size * ai.len).assertAligned(Index.Signature.alignment),
-          .@"1" = static.till(Child.Signature.static_size * ai.len),
+          .index = static.from(Child.Signature.static_size * ai.len).assertAligned(Index.Signature.alignment),
+          .child_static = static.till(Child.Signature.static_size * ai.len),
         };
       }
     }
 
     pub fn write(val: *const T, static: S, _dynamic: Signature.D) usize {
-      const index, var child_static = getStuff(static);
+      const stuff = getStuff(static);
+      var index = stuff.index;
+      var child_static = stuff.child_static;
       var dynamic = _dynamic;
       // First iteration
       var dwritten: context.options.offset_int = @intCast(Child.write(&val[0], child_static, dynamic));
@@ -579,14 +584,16 @@ pub fn GetArrayMergedT(context: Context) type {
       inline for (1..ai.len) |i| {
         const item = &val[i];
 
-        dwritten = std.mem.alignForward(context.options.offset_int, dwritten, Child.Signature.D.alignment);
+        if (comptime !Child.Signature.D.need_len) dwritten = std.mem.alignForward(context.options.offset_int, dwritten, Child.Signature.D.alignment);
+        std.debug.assert(0 == Index.write(&dwritten, index, undefined));
+        index = index.from(Index.Signature.static_size).assertAligned(Index.Signature.alignment);
+        if (comptime Child.Signature.D.need_len) dwritten = std.mem.alignForward(context.options.offset_int, dwritten, Child.Signature.D.alignment);
+
         const written = Child.write(item, child_static, dynamic.from(dwritten).assertAligned(.fromByteUnits(Child.Signature.D.alignment)));
         if (builtin.mode == .Debug) {
           std.debug.assert(written == Child.getDynamicSize(item, @intFromPtr(dynamic.ptr) - @intFromPtr(_dynamic.ptr)));
         }
 
-        std.debug.assert(0 == Index.write(&dwritten, index, undefined));
-        index = index.from(Index.Signature.static_size).assertAligned(Index.Signature.alignment);
         child_static = child_static.from(Child.Signature.static_size).assertAligned(Child.Signature.alignment);
         dwritten += @intCast(written);
       }
@@ -615,15 +622,17 @@ pub fn GetArrayMergedT(context: Context) type {
       pub const Parent = Self;
 
       pub fn get(self: GS, i: usize) FnReturnType(@TypeOf(Child.read)) {
-        if (i == 0) return Child.read(self._static, self._dynamic);
-        const offset_from = if (i == 0) 0 else Index.read(self._index.from(Index.Signature.static_size * (i - 1)).assertAligned(Index.Signature.alignment), undefined).*;
-        const offset_till = if (!Child.Signature.D.need_len) {} else if (i == ai.len - 1) self._dynamic.len
-          else Index.read(self._index.from(Index.Signature.static_size * i).assertAligned(Index.Signature.alignment), undefined).*;
+        const _child_dynamic = if (!Child.Signature.D.need_len) self._dynamic else self._dynamic.upto(
+          if (i == ai.len - 1) self._dynamic.len
+          else Index.read(self._index.from(Index.Signature.static_size * i).assertAligned(Index.Signature.alignment), undefined).*
+        );
 
-        var dynamic = self._dynamic.from(offset_from).assertAligned(.fromByteUnits(Child.Signature.D.alignment));
-        if (Child.Signature.D.need_len) dynamic = dynamic.till(offset_till); // length needed
+        const index_from_misaligned = if (i == 0) 0 else Index.read(self._index.from(Index.Signature.static_size * (i - 1)).assertAligned(Index.Signature.alignment), undefined).*;
+        const index_from = if (comptime Child.Signature.D.need_len)
+          std.mem.alignForward(context.options.offset_int, index_from_misaligned, @intCast(Index.Signature.alignment.toByteUnits()));
+        const child_dynamic = _child_dynamic.from(index_from).assertAligned(.fromByteUnits(Child.Signature.D.alignment));
 
-        return Child.read(self._static.from(Child.Signature.static_size * i).assertAligned(.fromByteUnits(Child.Signature.alignment)), dynamic);
+        return Child.read(self._static.from(Child.Signature.static_size * i).assertAligned(Child.Signature.alignment), child_dynamic);
       }
 
       /// WARNING: This set method is dangerous. It cannot handle cases where the new value has a different dynamic size than the old one
@@ -649,8 +658,8 @@ pub fn GetArrayMergedT(context: Context) type {
     };
 
     pub fn read(static: S, dynamic: Signature.D) GS {
-      const index, const child_static = getStuff(static);
-      return .{ ._index = index, ._static = child_static, ._dynamic = dynamic };
+      const stuff = getStuff(static);
+      return .{ ._index = stuff.index, ._static = stuff.child_static, ._dynamic = dynamic };
     }
   };
 }
@@ -688,6 +697,9 @@ pub fn GetStructMergedT(context: Context) type {
       is_dynamic: bool,
       /// is this field an offset field
       is_offset: bool,
+      /// If the dynamic field before this needs the len for dynamic buffer
+      /// This is always false for the static fields and for the first dynamic field
+      prev_needs_len: bool,
 
       pub fn sized(self: @This()) std.builtin.Type.StructField {
         return .{
@@ -706,22 +718,23 @@ pub fn GetStructMergedT(context: Context) type {
           .type = struct {
             fn getSD(me: *const @This()) struct { _static: Bytes(self.merged.Signature.alignment), _dynamic: if (self.is_dynamic) self.merged.Signature.D else void } {
               const parent_ptr: *const RetTypeStruct = @alignCast(@fieldParentPtr(self.original.name, me));
-              const sd = @field(parent_ptr, "\x00offset\xff");
+              const sd = @field(parent_ptr, "\xffoffset\xff");
               const layout_struct: *const OptimalLayoutStruct = @ptrCast(sd._static.ptr);
 
               const static = sd._static.from(@offsetOf(OptimalLayoutStruct, self.original.name)).assertAligned(self.merged.Signature.alignment);
               if (!self.is_dynamic) return .{ ._static = static, ._dynamic = undefined };
 
-              const dynamic_from = sd._dynamic.from(@field(layout_struct, "\x00offset\xff" ++ self.original.name)).assertAligned(.fromByteUnits(self.merged.Signature.D.alignment));
-              if (!self.merged.Signature.D.need_len) return .{ ._static = static, ._dynamic = dynamic_from };
-
               const next_index = comptime blk: {
                 for (index + 1 .. fields.len) |i| if (fields[i].is_dynamic) break :blk i;
                 break :blk fields.len;
               };
-              if (next_index == fields.len) return .{ ._static = static, ._dynamic = dynamic_from };
+              const _dynamic = if (!self.merged.Signature.D.need_len or next_index == fields.len) sd._dynamic else
+                sd._dynamic.upto(@field(layout_struct, "\xffoffset\xff" ++ fields[next_index].original.name));
+              var dynamic_from = @field(layout_struct, "\xffoffset\xff" ++ self.original.name);
+              if (self.prev_needs_len) dynamic_from = if (@TypeOf(dynamic_from) == u0) 0
+                else std.mem.alignForward(context.options.offset_int, dynamic_from, self.merged.Signature.D.alignment);
 
-              return .{ ._static = static, ._dynamic = dynamic_from.upto(@field(layout_struct, "\x00offset\xff" ++ fields[next_index].original.name)) };
+              return .{ ._static = static, ._dynamic = _dynamic.from(dynamic_from).assertAligned(.fromByteUnits(self.merged.Signature.D.alignment)) };
             }
 
             pub fn read(me: *const @This()) FnReturnType(@TypeOf(self.merged.read)) {
@@ -738,9 +751,10 @@ pub fn GetStructMergedT(context: Context) type {
 
     const fields = blk: {
       var processed: []const ProcessedField = &.{};
+      var last_needs_len = false;
 
       for (si.fields) |f| {
-        std.debug.assert(!std.mem.startsWith(u8, f.name, "\x00offset\xff")); // This is not allowed
+        std.debug.assert(!std.mem.startsWith(u8, f.name, "\xffoffset\xff")); // This is not allowed
         const merged_child = next_context.realign(.fromByteUnits(f.alignment)).T(f.type).merge();
         const is_dynamic = std.meta.hasFn(merged_child, "getDynamicSize");
         processed = processed ++ &[1]ProcessedField{.{
@@ -748,11 +762,12 @@ pub fn GetStructMergedT(context: Context) type {
           .merged = merged_child,
           .is_dynamic = is_dynamic,
           .is_offset = false,
+          .prev_needs_len = is_dynamic and last_needs_len,
         }};
         if (is_dynamic) {
           processed = processed ++ &[1]ProcessedField{.{
             .original = std.builtin.Type.StructField{
-              .name = "\x00offset\xff" ++ f.name,
+              .name = "\xffoffset\xff" ++ f.name,
               .type = context.options.offset_int,
               .alignment = @alignOf(context.options.offset_int),
               .default_value_ptr = null,
@@ -761,7 +776,9 @@ pub fn GetStructMergedT(context: Context) type {
             .merged = next_context.realign(null).T(context.options.offset_int).merge(),
             .is_dynamic = false,
             .is_offset = true,
+            .prev_needs_len = false,
           }};
+          last_needs_len = merged_child.Signature.D.need_len;
         }
       }
 
@@ -827,7 +844,7 @@ pub fn GetStructMergedT(context: Context) type {
         if (!f1.is_dynamic) continue;
         for (processed_array, 0..) |f2, i| {
           if (!f2.is_offset) continue;
-          if (!std.mem.eql(u8, "\x00offset\xff" ++ f1.original.name, f2.original.name)) continue;
+          if (!std.mem.eql(u8, "\xffoffset\xff" ++ f1.original.name, f2.original.name)) continue;
           processed_array[i].original.type = u0;
           break;
         }
@@ -855,7 +872,7 @@ pub fn GetStructMergedT(context: Context) type {
 
       var fields_array: [1 + si.fields.len]std.builtin.Type.StructField = undefined;
       fields_array[0] = .{ // This field will contain static/dynmic pair
-        .name = "\x00offset\xff",
+        .name = "\xffoffset\xff",
         .type = SD,
         .alignment = @alignOf(SD),
         .default_value_ptr = null,
@@ -898,17 +915,18 @@ pub fn GetStructMergedT(context: Context) type {
           continue;
         }
 
-        dwritten = std.mem.alignForward(context.options.offset_int, dwritten, @intCast(f.merged.Signature.D.alignment));
+        if (comptime !f.prev_needs_len) dwritten = std.mem.alignForward(context.options.offset_int, dwritten, @intCast(f.merged.Signature.D.alignment));
         const child_dynamic = dynamic.from(dwritten).assertAligned(.fromByteUnits(f.merged.Signature.D.alignment));
         const written = f.merged.write(&@field(val.*, f.original.name), child_static, child_dynamic);
+        if (comptime f.prev_needs_len) dwritten = std.mem.alignForward(context.options.offset_int, dwritten, @intCast(f.merged.Signature.D.alignment));
 
-        if (@FieldType(OptimalLayoutStruct, "\x00offset\xff" ++ f.original.name) == u0) {
+        if (@FieldType(OptimalLayoutStruct, "\xffoffset\xff" ++ f.original.name) == u0) {
           if (0 != dwritten) {
             std.debug.panic("Offset field {s} is not at the beginning of the struct", .{f.original.name});
             unreachable;
           }
         } else {
-          @field(layout_struct, "\x00offset\xff" ++ f.original.name) = dwritten;
+          @field(layout_struct, "\xffoffset\xff" ++ f.original.name) = dwritten;
         }
 
         dwritten += @intCast(written);
@@ -932,7 +950,7 @@ pub fn GetStructMergedT(context: Context) type {
 
     pub fn read(static: S, dynamic: Signature.D) RetTypeStruct {
       var retval: RetTypeStruct = undefined;
-      @field(retval, "\x00offset\xff") = .{ ._static = static, ._dynamic = dynamic };
+      @field(retval, "\xffoffset\xff") = .{ ._static = static, ._dynamic = dynamic };
       return retval;
     }
   };
@@ -1064,6 +1082,7 @@ pub fn GetUnionMergedT(context: Context) type {
   const ui = @typeInfo(T).@"union";
 
   const Retval = opaque {
+    const Tag = ui.tag_type.?;
     const next_context = context.see(T, @This());
 
     const S = Bytes(Signature.alignment);
@@ -1082,18 +1101,15 @@ pub fn GetUnionMergedT(context: Context) type {
       /// is this field dynamic
       is_dynamic: bool,
 
-      pub fn sized(self: @This()) std.builtin.Type.StructField {
+      pub fn sized(self: @This()) std.builtin.Type.UnionField {
         return .{
           .name = self.original.name,
           .type = [self.merged.Signature.static_size]u8,
           .alignment = self.original.alignment,
-          .default_value_ptr = null,
-          .is_comptime = false,
         };
       }
 
-      pub fn wrapped(self: @This()) std.builtin.Type.StructField {
-        std.debug.assert(!self.is_offset);
+      pub fn wrapped(self: @This()) std.builtin.Type.UnionField {
         return .{
           .name = self.original.name,
           .type = struct {
@@ -1105,8 +1121,6 @@ pub fn GetUnionMergedT(context: Context) type {
             }
           },
           .alignment = self.original.alignment,
-          .default_value_ptr = null,
-          .is_comptime = false,
         };
       }
     };
@@ -1138,13 +1152,13 @@ pub fn GetUnionMergedT(context: Context) type {
     };
 
     const LayoutUnion = blk: {
-      var fields_array: [fields.len]std.builtin.Type.StructField = undefined;
+      var fields_array: [fields.len]std.builtin.Type.UnionField = undefined;
       for (fields, 0..) |f, i| fields_array[i] = f.sized();
       break :blk @Type(.{.@"union" = .{
         .layout = .auto,
+        .tag_type = Tag,
         .fields = &fields_array,
         .decls = &.{},
-        .is_tuple = false,
       }});
     };
 
@@ -1152,55 +1166,59 @@ pub fn GetUnionMergedT(context: Context) type {
     const RetTypeUnion = blk: {
       if (false) break :blk T; // hack to make unions show their fields in lsp
 
-      var fields_array: [ui.fields.len]std.builtin.Type.StructField = undefined;
-      for (fields, 0..) |f, i| fields_array[i] = f.wrapped(i);
+      var fields_array: [ui.fields.len]std.builtin.Type.UnionField = undefined;
+      for (fields, 0..) |f, i| fields_array[i] = f.wrapped();
       break :blk @Type(.{.@"union" = .{
         .layout = .auto,
+        .tag_type = Tag,
         .fields = &fields_array,
         .decls = &.{},
-        .is_tuple = false,
       }});
     };
 
     pub fn write(val: *const T, static: S, dynamic: Signature.D) usize {
       const active_tag = std.meta.activeTag(val.*);
-      inline for (fields) |f| {
-        if (!std.mem.eql(u8, f.original.name, @tagName(active_tag))) continue;
+      inline for (fields) |f| if (@field(Tag, f.original.name) == active_tag) {
         if (!f.is_dynamic) {
-          std.debug.assert(0 == f.merged.write(&@field(val.*, f.original.name), static, undefined));
+          std.debug.assert(0 == f.merged.write(&@field(val.*, f.original.name), .{ .ptr = static.ptr, .len = static.len }, undefined));
           return 0;
         }
 
-        const child_dynamic = dynamic.alignForward(f.merged.Signature.D.alignment);
+        const child_dynamic = dynamic.alignForward(.fromByteUnits(f.merged.Signature.D.alignment));
         const written = f.merged.write(&@field(val.*, f.original.name), static, child_dynamic);
 
         return written + @intFromPtr(child_dynamic.ptr) - @intFromPtr(dynamic.ptr);
-      }
+      };
+      unreachable;
     }
 
     pub fn getDynamicSize(val: *const T, size: usize) usize {
       const active_tag = std.meta.activeTag(val.*);
-      inline for (fields) |f| {
-        if (!std.mem.eql(u8, f.original.name, @tagName(active_tag))) continue;
+      inline for (fields) |f| if (std.mem.eql(u8, f.original.name, @tagName(active_tag))) {
         if (!f.is_dynamic) return size;
-
-        const child_dynamic = size.alignForward(f.merged.Signature.D.alignment);
-        return f.merged.getDynamicSize(&@field(val.*, f.original.name), child_dynamic);
-      }
+        const new_size = std.mem.alignForward(usize, size, f.merged.Signature.D.alignment);
+        return f.merged.getDynamicSize(&@field(val.*, f.original.name), new_size);
+      };
+      unreachable;
     }
 
     pub fn read(static: S, dynamic: Signature.D) RetTypeUnion {
-      const val: LayoutUnion = @ptrCast(static.ptr);
+      const val: *LayoutUnion = @ptrCast(static.ptr);
       const active_tag = std.meta.activeTag(val.*);
-      inline for (fields) |f| {
-        if (!std.mem.eql(u8, f.original.name, @tagName(active_tag))) continue;
-        const child_static_ptr = &@field(val, f.original.name);
-        const child_static = .{ .ptr = child_static_ptr, .len = static.len }; // The length of this is wrong but that should not be a problem
-        if (!f.is_dynamic) return @unionInit(RetTypeUnion, f.original.name, .{ ._static = static, ._dynamic = undefined });
+      inline for (fields) |f| if (@field(Tag, f.original.name) == active_tag) {
+        // The length of static is wrong but that should not be a problem
+        if (!f.is_dynamic) return @unionInit(RetTypeUnion, f.original.name, .{
+          ._static = .{ .ptr = @alignCast(@ptrCast(&@field(val, f.original.name))), .len = static.len },
+          ._dynamic = undefined
+        });
 
-        const child_dynamic = dynamic.alignForward(f.merged.Signature.D.alignment);
-        return @unionInit(RetTypeUnion, f.original.name, .{ ._static = child_static, ._dynamic = child_dynamic });
-      }
+        const child_dynamic = dynamic.alignForward(.fromByteUnits(f.merged.Signature.D.alignment));
+        return @unionInit(RetTypeUnion, f.original.name, .{
+          ._static = .{ .ptr = @alignCast(@ptrCast(&@field(val, f.original.name))), .len = static.len },
+          ._dynamic = child_dynamic
+        });
+      };
+      unreachable;
     }
   };
 
@@ -1260,21 +1278,47 @@ const testing = std.testing;
 const expectEqual = @import("testing.zig").expectEqual;
 
 /// Recursively compares an original value with the accessor struct returned by `read()`.
-fn expectEqualRead(expected: anytype, reader: anytype) !void {
+fn expectEqualRead(expected: anytype, _reader: anytype) !void {
   const print = std.debug.print;
 
-  const rhs = switch (@typeInfo(@TypeOf(reader))) {
-    .@"opaque" => {},
-    .@"pointer" => |pi| switch (pi.size) {
-      .one => reader.*,
-      else => reader,
+  const reader = switch (@typeInfo(@TypeOf(_reader))) {
+    .pointer => |pi| switch (pi.size) {
+      .one => _reader.*,
+      else => _reader,
     },
-    else => reader,
+    else => _reader,
   };
 
-  if (@TypeOf(expected) == @TypeOf(rhs)) {
-    return expectEqual(expected, rhs);
-  } 
+  if (comptime (std.meta.activeTag(@typeInfo(@TypeOf(expected))) == std.meta.activeTag(@typeInfo(@TypeOf(reader))))) {
+    switch (@typeInfo(@TypeOf(expected))) {
+      .pointer => |pi| {
+        const rpi = @typeInfo(@TypeOf(reader)).pointer;
+        if (pi.size == rpi.size) {
+          switch (pi.size) {
+            .one => return expectEqualRead(expected.*, reader.*),
+            .many, .c, .slice => return expectEqual(expected, reader),
+          }
+        }
+      },
+      .optional => {
+        if (expected == null or reader == null) {
+          if (expected == null and reader == null) return;
+          if (expected) |v| print("expected {any}, found null\n", .{v});
+          if (reader) |v| print("expected null, found {any}\n", .{v});
+          return error.TestExpectedEqual;
+        }
+        return expectEqualRead(expected.?, reader.?);
+      },
+      .error_union => {
+        if (std.meta.isError(expected) or std.meta.isError(reader)) return expectEqual(expected, reader);
+        return expectEqualRead(expected catch unreachable, reader catch unreachable);
+      },
+      .@"struct", .@"union" => {},
+      else => return expectEqual(expected, reader),
+    }
+  }
+
+  if (@TypeOf(expected) == @TypeOf(reader)) return expectEqual(expected, reader);
 
   switch (@typeInfo(@TypeOf(expected))) {
     .noreturn, .@"opaque", .frame, .@"anyframe", .void, .type, .bool, .int, .float,
@@ -1288,8 +1332,8 @@ fn expectEqualRead(expected: anytype, reader: anytype) !void {
           @compileError("value of type " ++ @typeName(@TypeOf(reader)) ++ " encountered, expected " ++ @typeName(@TypeOf(expected))),
         .slice => {
           for (expected, 0..) |ve, i| {
-            expectEqual(ve, reader.get(@intCast(i))) catch |e| {
-              print("index {d} incorrect. expected {any}, found {any}\n", .{ i, expected[i], reader.get(@intCast(i)) });
+            expectEqualRead(ve, reader.get(@intCast(i))) catch |e| {
+              print("index {d} incorrect.\nexpected :{any}\n, found {any}\n", .{ i, ve, reader.get(@intCast(i)) });
               return e;
             };
           }
@@ -1299,8 +1343,8 @@ fn expectEqualRead(expected: anytype, reader: anytype) !void {
 
     .array => {
       for (expected, 0..) |ve, i| {
-        expectEqual(ve, reader.get(i)) catch |e| {
-          print("index {d} incorrect. expected {any}, found {any}\n", .{ i, expected[i], reader.get(i) });
+        expectEqualRead(ve, reader.get(i)) catch |e| {
+          print("index {d} incorrect.\nexpected :{any}\n, found {any}\n", .{ i, expected[i], reader.get(i) });
           return e;
         };
       }
@@ -1308,7 +1352,13 @@ fn expectEqualRead(expected: anytype, reader: anytype) !void {
 
     .@"struct" => |struct_info| {
       inline for (struct_info.fields) |field| {
-        try expectEqualRead(@field(expected, field.name), @field(reader, field.name).read());
+        errdefer print("field `{s}` incorrect\n", .{ field.name });
+
+        if (std.meta.hasFn(@FieldType(@TypeOf(reader), field.name), "read")) {
+          try expectEqualRead(@field(expected, field.name), @field(reader, field.name).read());
+        } else {
+          try expectEqual(@field(expected, field.name), @field(reader, field.name));
+        }
       }
     },
 
@@ -1322,14 +1372,16 @@ fn expectEqualRead(expected: anytype, reader: anytype) !void {
       try expectEqual(expectedTag, actualTag);
 
       switch (expected) {
-        inline else => |val, tag| try expectEqual(val, @field(actual, @tagName(tag)).read()),
+        inline else => |val, tag| return if (std.meta.hasFn(@FieldType(@TypeOf(reader), tag), "read"))
+          expectEqualRead(val, @field(actual, @tagName(tag)).read())
+          else expectEqual(val, @field(actual, @tagName(tag))),
       }
     },
 
     .optional => {
       if (expected) |expected_payload| {
         if (reader) |actual_payload| {
-          try expectEqual(expected_payload, actual_payload.get());
+          try expectEqualRead(expected_payload, actual_payload.get());
         } else {
           print("expected {any}, found null\n", .{expected_payload});
           return error.TestExpectedEqual;
@@ -1346,7 +1398,7 @@ fn expectEqualRead(expected: anytype, reader: anytype) !void {
       const actual = reader.read();
       if (expected) |expected_payload| {
         if (actual) |actual_payload| {
-          try expectEqual(expected_payload, actual_payload);
+          try expectEqualRead(expected_payload, actual_payload);
         } else |actual_err| {
           print("expected {any}, found {}\n", .{ expected_payload, actual_err });
           return error.TestExpectedEqual;
@@ -1383,7 +1435,6 @@ fn _testMergingReading(value: anytype, comptime options: ToMergedOptions) !void 
   const written_dynamic_size = MergedT.write(&value, .initAssert(buffer[0..static_size]), .initAssert(buffer[dynamic_from..]));
   try testing.expectEqual(dynamic_size, written_dynamic_size);
 
-  // std.debug.print("written_len: {any}\n", .{written_dynamic_size});
   const reader = MergedT.read(.initAssert(buffer[0..static_size]), .initAssert(buffer[dynamic_from..dynamic_from + written_dynamic_size]));
   try expectEqualRead(value, reader);
 }
@@ -1504,5 +1555,21 @@ test "complex struct" {
 
   value.d = null;
   try testMerging(value);
+}
+
+test "slice of complex structs" {
+  const Item = struct {
+    id: u64,
+    name: []const u8,
+    is_active: bool,
+  };
+
+  const items = [_]Item{
+    .{ .id = 1, .name = "first", .is_active = true },
+    .{ .id = 2, .name = "second", .is_active = false },
+    .{ .id = 3, .name = "", .is_active = true },
+  };
+
+  try testMerging(items[0..]);
 }
 

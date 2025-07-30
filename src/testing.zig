@@ -32,7 +32,7 @@ pub fn expectEqual(expected: anytype, actual: anytype) error{TestExpectedEqual}!
         .one, .many, .c => {
           if (actual == expected) {
             // std.debug.dumpCurrentStackTrace(null);
-            // std.debug.print("pointers are same for {s}\n", .{ @typeName(@TypeOf(actual)) });
+            // print("pointers are same for {s}\n", .{ @typeName(@TypeOf(actual)) });
             return;
           }
           return expectEqual(actual.*, expected.*);
@@ -40,16 +40,17 @@ pub fn expectEqual(expected: anytype, actual: anytype) error{TestExpectedEqual}!
         .slice => {
           if (actual.len != expected.len) {
             print("expected slice len {}, found {}\n", .{ expected.len, actual.len });
+            print("expected: {any}\nactual: {any}\n", .{ expected, actual });
             return error.TestExpectedEqual;
           }
           if (actual.ptr == expected.ptr) {
             // std.debug.dumpCurrentStackTrace(null);
-            // std.debug.print("slices are same for {s}\n", .{ @typeName(@TypeOf(actual)) });
+            // print("slices are same for {s}\n", .{ @typeName(@TypeOf(actual)) });
             return;
           }
           for (actual, expected, 0..) |va, ve, i| {
             expectEqual(va, ve) catch |e| {
-              print("index {d} incorrect. expected {any}, found {any}\n", .{ i, expected[i], actual[i] });
+              print("index {d} incorrect.\nexpected:: {any}\nfound:: {any}\n", .{ i, expected[i], actual[i] });
               return e;
             };
           }
@@ -60,7 +61,7 @@ pub fn expectEqual(expected: anytype, actual: anytype) error{TestExpectedEqual}!
     .array => |array| {
       inline for (0..array.len) |i| {
         expectEqual(expected[i], actual[i]) catch |e| {
-          print("index {d} incorrect. expected {any}, found {any}\n", .{ i, expected[i], actual[i] });
+          print("index {d} incorrect.\nexpected:: {any}\nfound:: {any}\n", .{ i, expected[i], actual[i] });
           return e;
         };
       }
@@ -70,7 +71,7 @@ pub fn expectEqual(expected: anytype, actual: anytype) error{TestExpectedEqual}!
       var i: usize = 0;
       while (i < info.len) : (i += 1) {
         if (!std.meta.eql(expected[i], actual[i])) {
-          print("index {d} incorrect. expected {any}, found {any}\n", .{ i, expected[i], actual[i] });
+          print("index {d} incorrect.\nexpected:: {any}\nfound:: {any}\n", .{ i, expected[i], actual[i] });
           return error.TestExpectedEqual;
         }
       }
@@ -78,6 +79,7 @@ pub fn expectEqual(expected: anytype, actual: anytype) error{TestExpectedEqual}!
 
     .@"struct" => |structType| {
       inline for (structType.fields) |field| {
+        errdefer print("field `{s}` incorrect\n", .{ field.name });
         try expectEqual(@field(expected, field.name), @field(actual, field.name));
       }
     },
