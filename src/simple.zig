@@ -30,6 +30,9 @@ pub const ToMergedOptions = struct {
   serialize_unknown_pointer_as_usize: bool = false,
   /// Only allow for safe conversions (eg: compileError on trying to merge dynamic union, dynamic error union and dynamic optional)
   error_on_unsafe_conversion: bool = false,
+
+  /// the level of logging that is enabled
+  log_level: meta.LogLevel = .none,
 };
 
 /// We take in a type and just use its byte representation to store into bits.

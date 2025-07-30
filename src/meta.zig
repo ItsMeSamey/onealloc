@@ -166,6 +166,12 @@ fn BytesExtra(comptime _alignment: std.mem.Alignment, _keep_len: bool) type {
         .len = self.len - (aligned_ptr - @intFromPtr(self.ptr)) // Underflow => user error
       };
     }
+
+    pub fn format(self: @This(), comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: std.io.AnyWriter) !void {
+      _ = .{ fmt, options };
+      if (keep_len) try std.fmt.format(writer, "{any}", .{self.ptr[0..self.len]})
+      else try std.fmt.format(writer, "{s}.{{ ptr = {any}}}", .{ @typeName(@This()) , self.ptr });
+    }
   };
 }
 
@@ -176,6 +182,14 @@ pub fn Bytes(comptime _alignment: std.mem.Alignment) type {
 pub fn BytesLen(comptime _alignment: std.mem.Alignment) type {
   return BytesExtra(_alignment, true);
 }
+
+pub const LogLevel = enum(u8) {
+  none = 0,
+  warn = 1,
+  info = 2,
+  verbose = 3,
+  debug = 4,
+};
 
 pub fn GetContext(Options: type) type {
   return struct {
@@ -242,6 +256,11 @@ pub fn GetContext(Options: type) type {
       var retval = self;
       retval.options.T = new_T;
       return retval;
+    }
+
+    pub fn log(self: @This(), comptime log_level: LogLevel, comptime fmt: []const u8, args: anytype) void {
+      // std.debug.dumpCurrentStackTrace(null);
+      if (comptime @intFromEnum(log_level) <= @intFromEnum(self.options.log_level)) std.debug.print(fmt, args);
     }
   };
 }

@@ -39,6 +39,9 @@ pub const ToMergedOptions = struct {
   /// If you want to use just the pointer value for some reason and not what it is pointing to, consider using a fixed size int instead.
   /// WARNING: This probably should be kept false
   serialize_unknown_pointer_as_usize: bool = false,
+
+  /// the level of logging that is enabled
+  log_level: meta.LogLevel = .none,
 };
 
 /// We take in a type and just use its byte representation to store into bits.
@@ -421,6 +424,7 @@ pub fn GetSliceMergedT(context: Context) type {
         dwritten += @intCast(written);
       }
 
+      context.log(.verbose, "index: {d}\n", .{index});
       return dwritten + @intFromPtr(child_dynamic.ptr) - @intFromPtr(dynamic.ptr);
     }
 
@@ -512,6 +516,7 @@ pub fn GetSliceMergedT(context: Context) type {
       if (len_ptr.* == 0) return .{ ._len = len_ptr, ._index = undefined, ._static = undefined, ._dynamic = undefined };
 
       const stuff = getStuff(dynamic, len_ptr.*);
+      context.log(.verbose, "stuff.index: {d}\n", .{@as([*]context.options.offset_int, @ptrCast(stuff.index.ptr))[0..stuff.index.len / @sizeOf(context.options.offset_int)]});
       return .{
         ._len = len_ptr,
         ._index = stuff.index,
@@ -622,16 +627,20 @@ pub fn GetArrayMergedT(context: Context) type {
       pub const Parent = Self;
 
       pub fn get(self: GS, i: usize) FnReturnType(@TypeOf(Child.read)) {
+        context.log(.debug, "index: {any}\n", .{@as([*]context.options.offset_int, @ptrCast(self._index.ptr))[0..ai.len-1]});
+        context.log(.debug, "dynamic: {any}\n", .{self._dynamic});
         const _child_dynamic = if (!Child.Signature.D.need_len) self._dynamic else self._dynamic.upto(
           if (i == ai.len - 1) self._dynamic.len
           else Index.read(self._index.from(Index.Signature.static_size * i).assertAligned(Index.Signature.alignment), undefined).*
         );
 
+        context.log(.debug, "dynamic after uppercap: {any}\n", .{_child_dynamic});
         const index_from_misaligned = if (i == 0) 0 else Index.read(self._index.from(Index.Signature.static_size * (i - 1)).assertAligned(Index.Signature.alignment), undefined).*;
         const index_from = if (comptime Child.Signature.D.need_len)
-          std.mem.alignForward(context.options.offset_int, index_from_misaligned, @intCast(Index.Signature.alignment.toByteUnits()));
+          std.mem.alignForward(context.options.offset_int, index_from_misaligned, @intCast(Child.Signature.D.alignment));
         const child_dynamic = _child_dynamic.from(index_from).assertAligned(.fromByteUnits(Child.Signature.D.alignment));
 
+        context.log(.debug, "final dynamic: {any}\n", .{child_dynamic});
         return Child.read(self._static.from(Child.Signature.static_size * i).assertAligned(Child.Signature.alignment), child_dynamic);
       }
 
@@ -719,6 +728,7 @@ pub fn GetStructMergedT(context: Context) type {
             fn getSD(me: *const @This()) struct { _static: Bytes(self.merged.Signature.alignment), _dynamic: if (self.is_dynamic) self.merged.Signature.D else void } {
               const parent_ptr: *const RetTypeStruct = @alignCast(@fieldParentPtr(self.original.name, me));
               const sd = @field(parent_ptr, "\xffoffset\xff");
+              context.log(.debug, "sd: {any}\n", .{sd});
               const layout_struct: *const OptimalLayoutStruct = @ptrCast(sd._static.ptr);
 
               const static = sd._static.from(@offsetOf(OptimalLayoutStruct, self.original.name)).assertAligned(self.merged.Signature.alignment);
@@ -907,7 +917,12 @@ pub fn GetStructMergedT(context: Context) type {
       const layout_struct: *OptimalLayoutStruct = @ptrCast(static.ptr);
       var dwritten: context.options.offset_int = 0;
 
+      context.log(.debug, ">>>\n", .{});
+      inline for (fields) |f| context.log(.debug, "field: {s}\n", .{f.original.name});
+      context.log(.debug, "<<<\n", .{});
+
       inline for (fields) |f| {
+        context.log(.debug, "excountered: {s}\n", .{f.original.name});
         if (f.is_offset) continue;
         const child_static = static.from(@offsetOf(OptimalLayoutStruct, f.original.name)).assertAligned(f.merged.Signature.alignment);
         if (!f.is_dynamic) {
@@ -927,9 +942,15 @@ pub fn GetStructMergedT(context: Context) type {
           }
         } else {
           @field(layout_struct, "\xffoffset\xff" ++ f.original.name) = dwritten;
+          context.log(.debug, "written offset for field `{s}` = {d} = {d}\n", .{ f.original.name, dwritten, @field(layout_struct, "\xffoffset\xff" ++ f.original.name) });
         }
 
         dwritten += @intCast(written);
+      }
+
+      inline for (fields) |f| {
+        if (!f.is_offset) continue;
+        context.log(.verbose, "offset for field `{s}` = {d}\n", .{ f.original.name["\xffoffset\xff".len..], @field(layout_struct, f.original.name) });
       }
 
       return dwritten;
@@ -949,6 +970,7 @@ pub fn GetStructMergedT(context: Context) type {
     }
 
     pub fn read(static: S, dynamic: Signature.D) RetTypeStruct {
+      context.log(.debug, "read got:\nstatic: {any}\ndynamic: {any}\n", .{ static, dynamic });
       var retval: RetTypeStruct = undefined;
       @field(retval, "\xffoffset\xff") = .{ ._static = static, ._dynamic = dynamic };
       return retval;
@@ -1435,12 +1457,23 @@ fn _testMergingReading(value: anytype, comptime options: ToMergedOptions) !void 
   const written_dynamic_size = MergedT.write(&value, .initAssert(buffer[0..static_size]), .initAssert(buffer[dynamic_from..]));
   try testing.expectEqual(dynamic_size, written_dynamic_size);
 
+  if (@intFromEnum(options.log_level) >= @intFromEnum(meta.LogLevel.verbose)) {
+    std.debug.print("calling MergedT.read with:\nstatic: {any}\ndynamic: {any}\n", .{ buffer[0..static_size], buffer[dynamic_from..dynamic_from + written_dynamic_size] });
+  }
   const reader = MergedT.read(.initAssert(buffer[0..static_size]), .initAssert(buffer[dynamic_from..dynamic_from + written_dynamic_size]));
   try expectEqualRead(value, reader);
 }
 
+fn testMergingLevel(value: anytype, comptime log_level: Context.LogLevel) !void {
+  try _testMergingReading(value, .{ .T = @TypeOf(value), .log_level = log_level });
+}
+
 fn testMerging(value: anytype) !void {
   try _testMergingReading(value, .{ .T = @TypeOf(value) });
+}
+
+fn testMergingDebug(value: anytype) !void {
+  try _testMergingReading(value, .{ .T = @TypeOf(value), .log_level = .debug });
 }
 
 test "primitives" {
