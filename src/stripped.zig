@@ -84,18 +84,12 @@ pub fn GetZstPointerMergedT(context: Context) type {
     pub const Signature = MergedSignature{
       .T = T,
       .D = Bytes(.@"1"),
-      .static_size = if (is_optional) 1 else 0,
+      .static_size = Existence.Signature.static_size,
       .alignment = .@"1",
     };
 
     pub fn write(val: *const T, static: S, _: Signature.D) usize {
-      if (is_optional) {
-        if (val.* == null) {
-          std.debug.assert(0 == Existence.write(&@as(u1, 0), static, undefined));
-        } else {
-          std.debug.assert(0 == Existence.write(&@as(u1, 1), static, undefined));
-        }
-      }
+      if (is_optional) std.debug.assert(0 == Existence.write(&@as(u1, if (val.* == null) 0 else 1), static, undefined));
       return 0;
     }
 
@@ -139,6 +133,7 @@ pub fn GetPointerMergedT(context: Context) type {
 
   const Retval = opaque {
     const next_context = context.realign(.fromByteUnits(pi.alignment)).see(T, @This());
+    const Existence = GetDirectMergedT(context.T(if (is_optional and Child.Signature.static_size == 0) u1 else void));
     const Child = next_context.T(pi.child).merge();
     const SubStatic = !std.meta.hasFn(Child, "getDynamicSize");
 
@@ -146,17 +141,19 @@ pub fn GetPointerMergedT(context: Context) type {
     pub const Signature = MergedSignature{
       .T = T,
       .D = (if (is_optional or Child.Signature.D.need_len) BytesLen else Bytes)(if (is_optional) .@"1" else .fromByteUnits(pi.alignment)),
-      .static_size = 0,
+      .static_size = Existence.Signature.static_size,
       .alignment = .@"1",
     };
 
-    pub fn write(val: *const T, _: S, _dynamic: Signature.D) usize {
+    pub fn write(val: *const T, static: S, _dynamic: Signature.D) usize {
+      if (Existence.Signature.static_size != 0) Existence.write(&@as(u1, if (val.* == null) 0 else 1), static, undefined);
       if (is_optional and val.* == null) return 0;
 
       const dynamic = if (is_optional) _dynamic.alignForward(Child.Signature.alignment) else _dynamic;
       const child_static = dynamic.till(Child.Signature.static_size);
       // Align 1 if child is static, so no issue here, static and dynamic children an be written by same logic
-      const child_dynamic = dynamic.from(Child.Signature.static_size).alignForward(.fromByteUnits(Child.Signature.D.alignment));
+      const _child_dynamic = dynamic.from(Child.Signature.static_size).alignForward(.fromByteUnits(Child.Signature.D.alignment));
+      const child_dynamic = if (@TypeOf(_child_dynamic).need_len and !Child.Signature.D.need_len) _child_dynamic.till(_child_dynamic.len) else _child_dynamic;
       const written = Child.write(if (is_optional) val.*.? else val.*, child_static, child_dynamic);
 
       if (std.meta.hasFn(Child, "getDynamicSize") and builtin.mode == .Debug) {
@@ -188,28 +185,35 @@ pub fn GetPointerMergedT(context: Context) type {
 
     const Self = @This();
     pub const GS = struct {
-      _static: Signature.D,
-      _dynamic: Child.Signature.D,
+      _static: if (Existence.Signature.static_size != 0) Bytes(Existence.Signature.alignment) else void,
+      _dynamic: (if(Signature.D.need_len) BytesLen else Bytes)(Child.Signature.alignment),
 
       pub const Parent = Self;
-      pub fn get(self: GS) FnReturnType(@TypeOf(Child.read)) {
-        if (is_optional and self._static.len == 0) return null;
+      pub fn get(self: GS) if (is_optional and Existence.Signature.static_size != 0) ?FnReturnType(@TypeOf(Child.read)) else FnReturnType(@TypeOf(Child.read)) {
+        if (is_optional and Existence.Signature.static_size != 0 and Existence.read(self._static, undefined) == 0) return null;
 
-        return Child.read(self._static, self._dynamic);
+        const child_static = self._dynamic.till(Child.Signature.static_size);
+        const _child_dynamic = self._dynamic.from(Child.Signature.static_size).alignForward(.fromByteUnits(Child.Signature.D.alignment));
+        const child_dynamic = if (@TypeOf(_child_dynamic).need_len and !Child.Signature.D.need_len) _child_dynamic.till(_child_dynamic.len) else _child_dynamic;
+        return Child.read(child_static, child_dynamic);
       }
 
       pub fn set(self: GS, val: *const T) void {
-        std.debug.assert(val.* != null); // You cant make a non-null value null
-        self.get().set(if (is_optional) val.*.? else val.*);
+        if (Existence.Signature.static_size == 0) {
+          std.debug.assert(val.* != null); // You cant make a non-null value null
+          self.get().set(if (is_optional) val.*.? else val.*);
+        } else {
+          Parent.write(val, self._static, self._dynamic);
+        }
       }
     };
 
-    pub fn read(_: S, dynamic: Signature.D) if (is_optional) ?GS else GS {
-      const aligned = if (is_optional) dynamic.alignForward(Child.Signature.alignment) else dynamic;
-      if (is_optional and aligned.len == 0) return null;
-      const child_static = aligned.till(Child.Signature.static_size);
-      const child_dynamic = aligned.from(Child.Signature.static_size).alignForward(.fromByteUnits(Child.Signature.D.alignment));
-      return .{ ._static = child_static, ._dynamic = child_dynamic };
+    pub fn read(static: S, dynamic: Signature.D) if (is_optional and Existence.Signature.static_size == 0) ?GS else GS {
+      if (is_optional and Existence.Signature.static_size == 0 and dynamic.len == 0) return null;
+      return .{
+        ._static = if (Existence.Signature.static_size != 0) static else undefined,
+        ._dynamic = if (is_optional) dynamic.alignForward(Child.Signature.alignment) else dynamic
+      };
     }
   };
 
@@ -986,14 +990,15 @@ pub fn GetOptionalMergedT(context: Context) type {
     }
   };
 
-  if (!std.meta.hasFn(Retval.Child, "getDynamicSize")) return GetDirectMergedT(context);
+  if (!std.meta.hasFn(Retval.Sub, "getDynamicSize")) return GetDirectMergedT(context);
+  return Retval;
 }
 
 pub fn GetErrorUnionMergedT(context: Context) type {
   const T = context.options.T;
   const ei = @typeInfo(T).error_union;
 
-  return opaque {
+  const Retval = opaque {
     const next_context = context.T(union {
       ok: ei.payload,
       err: anyerror,
@@ -1041,6 +1046,9 @@ pub fn GetErrorUnionMergedT(context: Context) type {
       return .{ .sub = Sub.read(static, dynamic) };
     }
   };
+
+  if (!std.meta.hasFn(Retval.Sub, "getDynamicSize")) return GetDirectMergedT(context);
+  return Retval;
 }
 
 pub fn GetUnionMergedT(context: Context) type {
@@ -1061,7 +1069,7 @@ pub fn GetUnionMergedT(context: Context) type {
 
     const ProcessedField = struct {
       /// original field
-      original: std.builtin.Type.StructField,
+      original: std.builtin.Type.UnionField,
       /// the merged type
       merged: type,
       /// is this field dynamic
@@ -1312,16 +1320,15 @@ fn expectEqualRead(expected: anytype, reader: anytype) !void {
     },
 
     .optional => {
-      const actual = reader.read();
       if (expected) |expected_payload| {
-        if (actual) |actual_payload| {
-          try expectEqual(expected_payload, actual_payload);
+        if (reader) |actual_payload| {
+          try expectEqual(expected_payload, actual_payload.get());
         } else {
           print("expected {any}, found null\n", .{expected_payload});
           return error.TestExpectedEqual;
         }
       } else {
-        if (actual) |actual_payload| {
+        if (reader) |actual_payload| {
           print("expected null, found {any}\n", .{actual_payload});
           return error.TestExpectedEqual;
         }
@@ -1425,5 +1432,38 @@ test "structs" {
 test "enums" {
   const Color = enum { red, green, blue };
   try testMerging(Color.green);
+}
+
+test "optional" {
+  var x: ?i32 = 42;
+  try testMerging(x);
+  x = null;
+  try testMerging(x);
+
+  var y: i32 = 123;
+  var opt_ptr: ?*i32 = &y;
+  try testMerging(opt_ptr);
+
+  opt_ptr = null;
+  try testMerging(opt_ptr);
+}
+
+test "error_unions" {
+  const MyError = error{Oops};
+  var eu: MyError!u32 = 123;
+  try testMerging(eu);
+  eu = MyError.Oops;
+  try testMerging(eu);
+}
+
+test "unions" {
+  const Payload = union(enum) {
+    a: u32,
+    b: bool,
+    c: void,
+  };
+  try testMerging(Payload{ .a = 99 });
+  try testMerging(Payload{ .b = false });
+  try testMerging(Payload{ .c = {} });
 }
 

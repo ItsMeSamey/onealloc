@@ -4,7 +4,7 @@ pub fn expectEqual(expected: anytype, actual: anytype) error{TestExpectedEqual}!
   const print = std.debug.print;
 
   if (@TypeOf(actual) != @TypeOf(expected)) {
-    print("expected type {s}, found type {s}\n", .{ @typeName(expected), @typeName(actual) });
+    print("expected type {s}, found type {s}\n", .{ @typeName(@TypeOf(expected)), @typeName(@TypeOf(actual)) });
     return error.TestExpectedEqual;
   }
 
