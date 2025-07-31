@@ -1138,7 +1138,7 @@ pub fn GetUnionMergedT(context: Context) type {
             _static: Bytes(self.merged.Signature.alignment),
             _dynamic: self.merged.Signature.D,
 
-            pub fn read(me: *const @This()) FnReturnType(@TypeOf(self.merged.read)) {
+            pub fn read(me: @This()) FnReturnType(@TypeOf(self.merged.read)) {
               return self.merged.read(me._static, me._dynamic);
             }
           },
@@ -1386,17 +1386,16 @@ fn expectEqualRead(expected: anytype, _reader: anytype) !void {
 
     .@"union" => |union_info| {
       if (union_info.tag_type == null) @compileError("Unable to compare untagged union values for type " ++ @typeName(@TypeOf(reader)));
-      const actual = reader.get();
       const Tag = std.meta.Tag(@TypeOf(expected));
       const expectedTag = @as(Tag, expected);
-      const actualTag = @as(Tag, actual);
+      const actualTag = @as(Tag, reader);
 
       try expectEqual(expectedTag, actualTag);
 
       switch (expected) {
-        inline else => |val, tag| return if (std.meta.hasFn(@FieldType(@TypeOf(reader), tag), "read"))
-          expectEqualRead(val, @field(actual, @tagName(tag)).read())
-          else expectEqual(val, @field(actual, @tagName(tag))),
+        inline else => |val, tag| return if (std.meta.hasFn(@FieldType(@TypeOf(reader), @tagName(tag)), "read"))
+          expectEqualRead(val, @field(reader, @tagName(tag)).read())
+          else expectEqual(val, @field(reader, @tagName(tag))),
       }
     },
 
@@ -1694,5 +1693,41 @@ test "slice of structs with dynamic fields" {
 
   try testMerging(entries[0..]); // this is taken to be an array pointer
   try testMerging(@as([]const LogEntry, entries[0..]));
+}
+
+test "complex composition" {
+  const Complex1 = struct {
+    a: u32,
+    b: u32,
+    c: u32,
+  };
+
+  const Complex2 = struct {
+    a: Complex1,
+    b: []const Complex1,
+  };
+
+  const SuperComplex = struct {
+    a: Complex1,
+    b: Complex2,
+    c: []const union(enum) {
+      a: Complex1,
+      b: Complex2,
+    },
+  };
+
+  const value = SuperComplex{
+    .a = .{ .a = 1, .b = 2, .c = 3 },
+    .b = .{
+      .a = .{ .a = 4, .b = 5, .c = 6 },
+      .b = &.{.{ .a = 7, .b = 8, .c = 9 }},
+    },
+    .c = &.{
+      .{ .a = .{ .a = 10, .b = 11, .c = 12 } },
+      .{ .b = .{ .a = .{ .a = 13, .b = 14, .c = 15 }, .b = &.{.{ .a = 16, .b = 17, .c = 18 }} } },
+    },
+  };
+
+  try testMerging(value);
 }
 
